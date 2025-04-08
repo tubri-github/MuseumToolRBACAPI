@@ -281,118 +281,256 @@ async def search_ost(
 async def search_locality(
         query: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        fuzzy: bool = True,
         page: int = 1,
         limit: int = 10
 ) -> Dict[str, Any]:
     """
-    Search Locality data in Elasticsearch.
+    在Elasticsearch中搜索地理位置数据。
 
-    Args:
-        query: The search.py query string.
-        filters: Dictionary of field-value pairs to filter results.
-        page: Page number for pagination.
-        limit: Number of results per page.
-
-    Returns:
-        Dictionary containing search.py results and metadata.
+    返回包括筛选选项的结果，适用于表格筛选界面。
     """
     es = await get_es_client()
 
-    # Calculate offset for pagination
+    # 计算分页偏移量
     offset = (page - 1) * limit
 
-    # Build the search.py query
+    # 构建搜索查询
     search_body = {
         "from": offset,
         "size": limit,
         "query": {
             "bool": {
-                "must": [],
+                "should": [],
                 "filter": []
             }
         },
-        "sort": [
-            {"Locality1ID": {"order": "desc"}}
-        ]
+        "highlight": {
+            "fields": {
+                "full_text": {},
+                "locality_string": {},
+                "drainage": {},
+                "country": {},
+                "state": {},
+                "county": {},
+                "continent": {},
+                "island": {},
+                "island_group": {},
+                "waterbody": {},
+                "verbatim_collectors": {}
+            },
+            "pre_tags": ["<span class='highlight'>"],
+            "post_tags": ["</span>"]
+        },
+        "aggs": {
+            # 为表格筛选添加更多列的聚合
+            "countries": {
+                "terms": {
+                    "field": "country.keyword",
+                    "size": 100
+                }
+            },
+            "states": {
+                "terms": {
+                    "field": "state.keyword",
+                    "size": 100
+                }
+            },
+            "counties": {
+                "terms": {
+                    "field": "county.keyword",
+                    "size": 100
+                }
+            },
+            "continents": {
+                "terms": {
+                    "field": "continent.keyword",
+                    "size": 20
+                }
+            },
+            "drainages": {
+                "terms": {
+                    "field": "drainage.keyword",
+                    "size": 100
+                }
+            },
+            "waterbodies": {
+                "terms": {
+                    "field": "waterbody.keyword",
+                    "size": 100
+                }
+            },
+            "islands": {
+                "terms": {
+                    "field": "island.keyword",
+                    "size": 100
+                }
+            },
+            "island_groups": {
+                "terms": {
+                    "field": "island_group.keyword",
+                    "size": 100
+                }
+            },
+            "collectors": {
+                "terms": {
+                    "field": "verbatim_collectors.keyword",
+                    "size": 100
+                }
+            }
+        }
     }
 
-    # Add text search.py if query is provided
+    # 添加文本搜索（如果提供了查询）
     if query:
-        search_body["query"]["bool"]["must"].append({
-            "multi_match": {
-                "query": query,
-                "fields": [
-                    "FieldNo^3",
-                    "LocalityString^2",
-                    "Drainage^2",
-                    "WaterBody^2",
-                    "Country",
-                    "Continent",
-                    "State",
-                    "County",
-                    "VerbatimCollectors",
-                    "Remarks"
-                ],
-                "type": "best_fields",
-                "fuzziness": "AUTO"
+        search_body["query"]["bool"]["should"] = [
+            # 精确匹配 field_no
+            {
+                "term": {
+                    "field_no.keyword": {
+                        "value": query,
+                        "boost": 10
+                    }
+                }
+            },
+            # 精确短语匹配 locality_string.raw
+            {
+                "match_phrase": {
+                    "locality_string.raw": {
+                        "query": query,
+                        "boost": 5
+                    }
+                }
+            },
+            # 多字段模糊匹配
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": [
+                        "full_text^2",
+                        "name^3",
+                        "locality_string^3",
+                        "drainage",
+                        "country",
+                        "state",
+                        "county",
+                        "continent",
+                        "island",
+                        "island_group",
+                        "waterbody",
+                        "verbatim_collectors"
+                    ],
+                    "fuzziness": "AUTO" if fuzzy else "0",
+                    "boost": 1
+                }
             }
-        })
+        ]
+        search_body["query"]["bool"]["minimum_should_match"] = 1
     else:
-        search_body["query"]["bool"]["must"].append({"match_all": {}})
+        # 高级搜索：处理各个字段的查询
+        if filters:
+            for field, value in filters.items():
+                if not value:
+                    continue
 
-    # Add filters if provided
-    if filters:
-        for field, value in filters.items():
-            if value is not None:
-                if field == "fieldNo":
-                    # Special handling for fieldNo - use regexp for partial match
-                    search_body["query"]["bool"]["filter"].append({
-                        "regexp": {"FieldNo": f".*{value}.*"}
+                # field_no 和 start_date 用精确匹配
+                if field in ["field_no", "start_date"]:
+                    search_body["query"]["bool"]["should"].append({
+                        "term": {
+                            f"{field}.keyword": {
+                                "value": value,
+                                "boost": 10
+                            }
+                        }
                     })
-                elif field in ["Lat", "Lon"]:
-                    # Handle numeric filters as range
-                    if isinstance(value, dict) and ("min" in value or "max" in value):
-                        range_filter = {}
-                        if "min" in value and value["min"]:
-                            range_filter["gte"] = value["min"]
-                        if "max" in value and value["max"]:
-                            range_filter["lte"] = value["max"]
-                        if range_filter:
-                            search_body["query"]["bool"]["filter"].append({
-                                "range": {field: range_filter}
-                            })
-                    else:
-                        search_body["query"]["bool"]["filter"].append({
-                            "term": {field: value}
-                        })
-                else:
-                    # Default field filter
-                    if field in ["Country", "Continent", "State", "County", "Drainage", "WaterBody", "Inventory"]:
-                        search_body["query"]["bool"]["filter"].append({
-                            "term": {f"{field}.keyword": value}
-                        })
-                    else:
-                        search_body["query"]["bool"]["filter"].append({
-                            "term": {field: value}
-                        })
+                    continue
 
-    # Execute the search.py
-    result = await es.search(index="locality", body=search_body)
+                # 先 match_phrase 精确短语匹配
+                search_body["query"]["bool"]["should"].append({
+                    "match_phrase": {
+                        field: {
+                            "query": value,
+                            "boost": 3
+                        }
+                    }
+                })
 
-    # Extract and format the results
+                # 再 fallback 到模糊 match 查询
+                search_body["query"]["bool"]["should"].append({
+                    "match": {
+                        field: {
+                            "query": value,
+                            "fuzziness": "AUTO" if fuzzy else "0",
+                            "boost": 1
+                        }
+                    }
+                })
+
+            if not search_body["query"]["bool"]["should"]:
+                search_body["query"]["bool"]["should"].append({"match_all": {}})
+
+            search_body["query"]["bool"]["minimum_should_match"] = 1
+        else:
+            # 如果没有任何查询参数，返回所有结果
+            search_body["query"]["bool"]["should"].append({"match_all": {}})
+
+    # 执行搜索
+    result = await es.search(index="geo_gazetteer", body=search_body)
+
+    # 提取并格式化结果
     hits = result["hits"]["hits"]
     total = result["hits"]["total"]["value"]
 
-    items = [hit["_source"] for hit in hits]
+    items = []
+    for hit in hits:
+        item = hit["_source"]
+        # 添加高亮内容
+        if "highlight" in hit:
+            item["highlights"] = hit["highlight"]
+        items.append(item)
+
+    # 处理聚合，为表格列筛选提供选项
+    filter_options = {}
+    if "aggregations" in result:
+        aggs = result["aggregations"]
+
+        # 提取每个字段的唯一值作为表格筛选选项
+        for field_name, agg_name in [
+            ("country", "countries"),
+            ("state", "states"),
+            ("county", "counties"),
+            ("continent", "continents"),
+            ("drainage", "drainages"),
+            ("waterbody", "waterbodies"),
+            ("island", "islands"),
+            ("island_group", "island_groups"),
+            ("verbatim_collectors", "collectors")
+        ]:
+            if agg_name in aggs:
+                filter_options[field_name] = [
+                    {"value": bucket["key"], "count": bucket["doc_count"]}
+                    for bucket in aggs[agg_name]["buckets"]
+                    if bucket["key"]  # 排除空值
+                ]
+
+    # 提取所有可能的表格列
+    columns = set()
+    for item in items:
+        columns.update(item.keys())
+
+    # 过滤掉不需要作为表格列的字段
+    excluded_columns = {"highlights", "full_text", "related_terms", "synonyms", "source_text"}
+    columns = [col for col in columns if col not in excluded_columns]
 
     return {
         "code": 20000,
         "data": {
             "items": items,
             "total": total,
+            "columns": columns,
+            "filter_options": filter_options
         }
     }
-
 
 async def search_taxon(
         query: Optional[str] = None,

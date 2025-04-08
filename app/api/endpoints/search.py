@@ -8,7 +8,7 @@ from app.db.elasticsearch import get_es_client
 from app.services.search import search_ulm, search_ost, search_locality, search_taxon, search_loan, search_lots, dsl_from_filters, search_generic
 from app.services.es_sync import sync_all_data, sync_unified_data
 
-router = APIRouter(prefix="/search")
+router = APIRouter()
 
 class SearchResponse(BaseModel):
     code: int
@@ -241,40 +241,69 @@ async def search_loans_endpoint(
     result = await search_loan(query, filters, page, limit)
     return result
 
+
 @router.get("/locality", response_model=SearchResponse)
 async def search_locality_endpoint(
-    query: Optional[str] = None,
-    fieldNo: Optional[str] = None,
-    country: Optional[str] = None,
-    continent: Optional[str] = None,
-    state: Optional[str] = None,
-    county: Optional[str] = None,
-    drainage: Optional[str] = None,
-    waterbody: Optional[str] = None,
-    inventory: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100)
+        query: Optional[str] = None,
+        field_no: Optional[str] = None,
+        country: Optional[str] = None,
+        continent: Optional[str] = None,
+        state: Optional[str] = None,
+        county: Optional[str] = None,
+        drainage: Optional[str] = None,
+        waterbody: Optional[str] = None,
+        island: Optional[str] = None,
+        island_group: Optional[str] = None,
+        start_date: Optional[str] = None,
+        verbatim_collectors: Optional[str] = None,
+        fuzzy: bool = True,
+        page: int = Query(1, ge=1),
+        limit: int = Query(10, ge=1, le=100)
 ):
     """
-    Search Locality data with optional filtering.
+    搜索地理位置数据，支持多种过滤条件。
+
+    参数与HTML接口的搜索表单相匹配:
+    - query: 关键词搜索（跨多个字段）
+    - field_no: 编号
+    - country: 国家名称
+    - continent: 大陆名称
+    - state: 州/省名称
+    - county: 县/区名称
+    - drainage: 流域名称
+    - waterbody: 水体名称
+    - island: 岛屿
+    - island_group: 岛群
+    - start_date: 日期
+    - verbatim_collectors: 采集者名称
+    - fuzzy: 是否启用模糊匹配
+    - page: 分页页码
+    - limit: 每页结果数量
     """
-    # Build filter object
+    # 构建过滤器对象
     filters = {
-        "fieldNo": fieldNo,
-        "Country": country,
-        "Continent": continent,
-        "State": state,
-        "County": county,
-        "Drainage": drainage,
-        "WaterBody": waterbody,
-        "Inventory": inventory
+        "field_no": field_no,
+        "country": country,
+        "continent": continent,
+        "state": state,
+        "county": county,
+        "drainage": drainage,
+        "waterbody": waterbody,
+        "island": island,
+        "island_group": island_group,
+        "start_date": start_date,
+        "verbatim_collectors": verbatim_collectors
     }
 
-    # Remove None values
+    # 移除None值
     filters = {k: v for k, v in filters.items() if v is not None}
 
-    result = await search_locality(query, filters, page, limit)
-    return result
+    try:
+        result = await search_locality(query, filters, fuzzy, page, limit)
+        return result
+    except Exception as e:
+        print(f"Error searching localities: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching localities: {str(e)}")
 
 @router.get("/taxon", response_model=SearchResponse)
 async def search_taxon_endpoint(
@@ -620,12 +649,10 @@ async def unified_related_search(
     # Add text search if query is provided
     if query:
         search_body["query"]["bool"]["must"].append({
-            "match": {
-                "full_text": {
-                    "query": query,
-                    "fields": ["full_text"],
-                    "fuzziness": "AUTO"
-                }
+            "multi_match": {
+                "query": query,
+                "fields": ["full_text"],
+                "fuzziness": "AUTO"
             }
         })
     else:
@@ -894,17 +921,9 @@ async def unified_suggest(
         field: str = "full_text",
         size: int = 10
 ):
-    """
-    Get suggestions based on a partial query.
-
-    Args:
-        query: The partial query to get suggestions for.
-        field: The field to get suggestions from. Default is full_text.
-        size: Number of suggestions to return.
-    """
     es = await get_es_client()
 
-    # Map common fields to their unified index counterparts
+    # Map fields
     field_mapping = {
         "scientificName": "scientific_name",
         "fieldNo": "field_no",
@@ -915,28 +934,31 @@ async def unified_suggest(
 
     search_field = field_mapping.get(field, field)
 
-    # Build the suggestion query
+    # This is the correct structure for the suggest API
     search_body = {
         "suggest": {
             "text": query,
-            "completion": {
-                "field": f"{search_field}.suggest",
-                "size": size,
-                "fuzzy": {
-                    "fuzziness": "AUTO"
+            "completion_suggestion": {
+                "completion": {
+                    "field": f"{search_field}.suggest",
+                    "size": size,
+                    "fuzzy": {
+                        "fuzziness": "AUTO"
+                    }
                 }
             }
         }
     }
 
-    # Execute the suggest query
     result = await es.search(index="unified", body=search_body)
 
-    # Extract suggestions
+    # Extract suggestions from the nested structure
     suggestions = []
-    if "suggest" in result and "completion" in result["suggest"]:
-        for option in result["suggest"]["completion"][0]["options"]:
-            suggestions.append(option["text"])
+    if "suggest" in result and "completion_suggestion" in result["suggest"]:
+        for suggestion in result["suggest"]["completion_suggestion"]:
+            for option in suggestion.get("options", []):
+                if "text" in option:
+                    suggestions.append(option["text"])
 
     return {
         "code": 20000,

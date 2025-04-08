@@ -49,7 +49,7 @@ class ResponseModel(BaseModel):
 class PaginationParams:
     def __init__(
         self,
-        page: int = Query(1, ge=1, description="页码，从1开始"),
+        page: int = Query(1, ge=-1, description="页码，从1开始"),
         page_size: int = Query(10, ge=1, le=100, description="每页记录数")
     ):
         self.page = page
@@ -393,17 +393,20 @@ async def get_lots_advanced(
     sql += """
         ) join3 LEFT JOIN "Family" f ON f."FamilyID" = join3."FamilyID" AND f."FamilyID" != 0
     """
-
     # Add filter for taxonomic ID and family ID
+    filters = []
     if taxonId:
-        sql += f" AND (\"DTaxonID\" = '{taxonId}')"
-
+        filters.append(f'"DTaxonID" = \'{taxonId}\'')
     if familyID:
-        sql += f" AND f.\"FamilyID\" = '{familyID}'"
+        filters.append(f'f."FamilyID" = \'{familyID}\'')
+    if filters:
+        sql += " WHERE " + " AND ".join(filters)
 
     sql += """
     ) join4 LEFT JOIN "Preparation" pp ON pp."PrimaryID" = join4."MainPrimaryID"
     """
+
+
 
     count_sql = f"SELECT COUNT(*) FROM ({sql}) AS count_query"
 

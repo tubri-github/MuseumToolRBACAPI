@@ -31,14 +31,14 @@ app.include_router(lots.router, prefix="/api/lots", tags=["Lots"])
 app.include_router(species_stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(person.router, prefix="/api/person", tags=["Person"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
-
-# @app.on_event("startup")
-# async def startup_db_client():
-#     await init_es()
 #
-# @app.on_event("shutdown")
-# async def shutdown_db_client():
-#     await close_es()
+@app.on_event("startup")
+async def startup_db_client():
+    await init_es()
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    await close_es()
 
 @app.get("/")
 async def root():

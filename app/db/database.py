@@ -166,12 +166,13 @@ async def execute_paginated_query_with_count(
 ) -> Dict[str, Any]:
     """
     使用单独的计数查询执行分页查询，适用于复杂查询情况。
+    当 page = -1 时，返回所有结果而不分页。
 
     Args:
         main_query: 主查询 SQL
         count_query: 计数查询 SQL
         params: 查询参数
-        page: 页码 (从1开始)
+        page: 页码 (从1开始，特殊值 -1 表示返回所有结果)
         page_size: 每页记录数
 
     Returns:
@@ -180,17 +181,35 @@ async def execute_paginated_query_with_count(
     if params is None:
         params = []
 
-    # 计算偏移量
-    offset = (page - 1) * page_size
-
-    # 添加分页
-    paginated_query = f"{main_query} OFFSET {offset} LIMIT {page_size}"
-
-    # 执行查询
     async with get_db() as conn:
         # 获取总记录数
         count_record = await conn.fetchval(count_query, *params)
         total = int(count_record) if count_record is not None else 0
+
+        # 特殊情况：page = -1 表示返回所有结果不分页
+        if page == -1:
+            # 执行不带分页的查询，返回所有结果
+            records = await conn.fetch(main_query, *params)
+            record_list = [dict(record) for record in records]
+
+            return {
+                "code": 20000,
+                "data": {
+                    "items": record_list,
+                    "total": total,
+                    "page": 1,
+                    "page_size": total,
+                    "total_pages": 1,
+                    "has_next": False,
+                    "has_prev": False
+                }
+            }
+
+        # 正常分页情况
+        # 计算偏移量
+        offset = (page - 1) * page_size
+        # 添加分页
+        paginated_query = f"{main_query} OFFSET {offset} LIMIT {page_size}"
 
         # 获取分页数据
         records = await conn.fetch(paginated_query, *params)
