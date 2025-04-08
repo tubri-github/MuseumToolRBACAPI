@@ -4,14 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="87fdc0d4-7ba6-495e-9734-020b19cd9a82" name="Changes" comment="update requirements.txt">
+    <list default="true" id="87fdc0d4-7ba6-495e-9734-020b19cd9a82" name="Changes" comment="update es search">
       <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/api/endpoints/lots.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/api/endpoints/lots.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/api/endpoints/search.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/api/endpoints/search.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/db/database.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/db/database.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/services/search.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/services/search.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -118,7 +112,7 @@
       <workItem from="1744068933657" duration="83000" />
       <workItem from="1744069182130" duration="209000" />
       <workItem from="1744069481122" duration="199000" />
-      <workItem from="1744073268798" duration="13416000" />
+      <workItem from="1744073268798" duration="15209000" />
     </task>
     <task id="LOCAL-00001" summary="initial code commit">
       <option name="closed" value="true" />
@@ -152,7 +146,15 @@
       <option name="project" value="LOCAL" />
       <updated>1744048917737</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="update es search">
+      <option name="closed" value="true" />
+      <created>1744128969503</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1744128969503</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -163,7 +165,8 @@
     <MESSAGE value="remove .env" />
     <MESSAGE value="remove .idea/workspace.xml" />
     <MESSAGE value="update requirements.txt" />
-    <option name="LAST_COMMIT_MESSAGE" value="update requirements.txt" />
+    <MESSAGE value="update es search" />
+    <option name="LAST_COMMIT_MESSAGE" value="update es search" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
