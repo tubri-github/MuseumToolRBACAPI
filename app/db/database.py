@@ -78,6 +78,42 @@ async def execute_proc(proc_name: str, *args) -> Any:
         return result
 
 
+async def execute_transaction(statements: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """
+    将多个SQL语句作为单个事务执行，确保要么全部成功要么全部回滚。
+
+    Args:
+        statements: 包含SQL语句和参数的字典列表，格式为:
+                  [{"sql": "SQL语句", "params": [参数列表]}]
+
+    Returns:
+        List[List[Dict[str, Any]]]: 每个语句的执行结果列表
+    """
+    async with get_db() as conn:
+        # 开始事务
+        transaction = conn.transaction()
+        await transaction.start()
+
+        try:
+            results = []
+            for stmt in statements:
+                sql = stmt["sql"]
+                params = stmt.get("params", [])
+
+                # 执行SQL语句
+                records = await conn.fetch(sql, *params)
+                results.append([dict(record) for record in records])
+
+            # 提交事务
+            await transaction.commit()
+            return results
+
+        except Exception as e:
+            # 回滚事务
+            await transaction.rollback()
+            print(f"Transaction error: {str(e)}")
+            raise e
+
 async def execute_paginated_query(
         query: str,
         params: List[Any] = None,

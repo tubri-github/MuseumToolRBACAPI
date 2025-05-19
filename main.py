@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin
+from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin, data_file_processor
 from app.db.elasticsearch import init_es, close_es
 
 app = FastAPI(
@@ -31,6 +31,7 @@ app.include_router(lots.router, prefix="/api/lots", tags=["Lots"])
 app.include_router(species_stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(person.router, prefix="/api/person", tags=["Person"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
+app.include_router(data_file_processor.router, prefix="/api/file", tags=["File Processor"])
 #
 @app.on_event("startup")
 async def startup_db_client():
