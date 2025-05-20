@@ -156,7 +156,7 @@ class DatabaseUtils:
             INSERT INTO verbatim_locality (
                 "verbatim_locality_string", "verbatim_drainage", "verbatim_country", 
                 "verbatim_state", "verbatim_county", "verbatim_waterbody", 
-                "verbatim_lat", "verbatim_lon","verbatim_collect_date","verbatim_collector"
+                "verbatim_lat", "verbatim_lon","verbatim_collect_date","verbatim_collector","verbatim_fieldno"
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
             ) RETURNING "verbatim_localityid"
@@ -173,6 +173,7 @@ class DatabaseUtils:
                 record.get("verbatim_longitude"),
                 record.get("verbatim_collect_date"),
                 record.get("verbatim_collector"),
+                record.get("verbatim_fieldno"),
             ]
 
             statements.append({

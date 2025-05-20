@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+
+import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -32,7 +34,7 @@ class ConfirmImportModel(BaseModel):
 
 class ResponseModel(BaseModel):
     code: int
-    data: Dict[str, Any]
+    data:  dict = {}
     message: Optional[str] = None
 
 
@@ -222,7 +224,7 @@ async def validate_mapping(mapping_data: ImportMappingModel):
         }
 
         # 1. 验证必需字段
-        required_fields = ["family", "genus", "species"]
+        required_fields = ["prevNumber"]
         missing_fields = [field for field in required_fields if field not in mappings or not mappings[field]]
 
         if missing_fields:
@@ -372,6 +374,7 @@ async def validate_mapping(mapping_data: ImportMappingModel):
 
         # 存储验证结果
         await store_validation_result(file_id, validation_result)
+        validation_result = convert_numpy_types(validation_result)
 
         return ResponseModel(
             code=20000,
@@ -384,6 +387,19 @@ async def validate_mapping(mapping_data: ImportMappingModel):
             data={},
             message=f"Validation failed: {str(e)}"
         )
+def convert_numpy_types(obj):
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(i) for i in obj]
+    elif isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return convert_numpy_types(obj.tolist())
+    else:
+        return obj
 
 @router.post("/confirmImport", response_model=ResponseModel)
 async def confirm_import(import_data: ConfirmImportModel, background_tasks: BackgroundTasks):
@@ -502,7 +518,7 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
                     "verbatim_locality_id": None,
                     "collection_date": None,
                     "locality_id": None,
-                    "field_number": None,
+                    # "field_number": None,
                     "total_number": 1,
                     "storage": None,
                     "jar_size": None,
@@ -522,8 +538,8 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
                             record["collection_date"] = formatted_date if is_valid else None
                         elif field == "localityId":
                             record["locality_id"] = value if not pd.isna(value) else None
-                        elif field == "fieldNumber":
-                            record["field_number"] = str(value) if not pd.isna(value) else None
+                        # elif field == "fieldNumber":
+                        #     record["field_number"] = str(value) if not pd.isna(value) else None
                         elif field == "totalNumber":
                             record["total_number"] = int(float(value)) if not pd.isna(value) else 1
                         elif field == "storage":
@@ -561,11 +577,11 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
         for i, record in enumerate(valid_records):
             record["catalog_number"] = catalog_numbers[i]
 
-            # 如果没有字段编号，生成一个
-            if not record["field_number"]:
-                record["field_number"] = validation_utils.generate_field_number(
-                    sequence=i + 1
-                )
+            # # 如果没有字段编号，生成一个
+            # if not record["field_number"]:
+            #     record["field_number"] = validation_utils.generate_field_number(
+            #         sequence=i + 1
+            #     )
 
         # 插入Primary记录
         primary_ids = await db_utils.insert_primary_records(valid_records, batch_serial_id)
@@ -650,6 +666,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "verbatim_waterbody": None,
                 "verbatim_latitude": None,
                 "verbatim_longitude": None,
+                "verbatim_fieldno": None,
                 "original_text": None
             }
 
@@ -662,7 +679,8 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "drainage": "verbatim_drainage",
                 "waterbody": "verbatim_waterbody",
                 "latitude": "verbatim_latitude",
-                "longitude": "verbatim_longitude"
+                "longitude": "verbatim_longitude",
+                "field_number": "verbatim_fieldno"
             }
 
             locality_parts = []
@@ -688,7 +706,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "taxon_id": None,  # verbatim模式下不自动关联taxonomic表
                 "collection_date": None,
                 "locality_id": None,
-                "field_number": None,
+                # "field_number": None,
                 "total_number": 1,
                 "storage": None,
                 "jar_size": None,
@@ -712,8 +730,8 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         record["collection_date"] = formatted_date if is_valid else None
                     elif field == "localityId":
                         record["locality_id"] = value if not pd.isna(value) else None
-                    elif field == "fieldNumber":
-                        record["field_number"] = str(value) if not pd.isna(value) else None
+                    # elif field == "fieldNumber":
+                    #     record["field_number"] = str(value) if not pd.isna(value) else None
                     elif field == "totalNumber":
                         try:
                             record["total_number"] = int(float(value)) if not pd.isna(value) else 1
@@ -751,11 +769,11 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             record["verbatim_taxonomic_id"] = verbatim_taxonomic_ids[i] if i < len(verbatim_taxonomic_ids) else None
             record["verbatim_locality_id"] = verbatim_locality_ids[i] if i < len(verbatim_locality_ids) else None
 
-            # 如果没有字段编号，生成一个
-            if not record["field_number"]:
-                record["field_number"] = validation_utils.generate_field_number(
-                    sequence=i + 1
-                )
+            # # 如果没有字段编号，生成一个
+            # if not record["field_number"]:
+            #     record["field_number"] = validation_utils.generate_field_number(
+            #         sequence=i + 1
+            #     )
 
         # 7. 插入Primary记录
         print(f"插入 {len(valid_records)} 条 Primary 记录...")
