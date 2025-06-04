@@ -186,6 +186,9 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# 在 paste-2.txt 中修改 validate_mapping 函数
+# 替换原来的物种匹配部分
+
 @router.post("/validateMapping", response_model=ResponseModel)
 async def validate_mapping(mapping_data: ImportMappingModel):
     """
@@ -234,55 +237,9 @@ async def validate_mapping(mapping_data: ImportMappingModel):
                 message=f"Missing required field mappings: {', '.join(missing_fields)}"
             )
 
-        # # 2. 验证分类学名称格式
-        # taxonomic_issues = []
-        # invalid_taxonomic_records = []
-        #
-        # for idx, row in df.iterrows():
-        #     family = row.get(mappings["family"]) if mappings.get("family") else None
-        #     genus = row.get(mappings["genus"]) if mappings.get("genus") else None
-        #     species = row.get(mappings["species"]) if mappings.get("species") else None
-        #
-        #     # Check if both genus and species have valid values
-        #     if genus and species and not pd.isna(genus) and not pd.isna(species):
-        #         # Format the scientific name properly before validation
-        #         formatted_name = str(genus).capitalize() + ' ' + str(species).lower()
-        #         is_valid, normalized_genus, normalized_species, error_msg = await validate_scientific_name(
-        #             formatted_name)
-        #     else:
-        #         # Handle the case where genus or species is missing
-        #         is_valid = False
-        #         normalized_genus = None
-        #         normalized_species = None
-        #         error_msg = "Missing genus or species"
-        #
-        #     if not is_valid:
-        #         taxonomic_issues.append(idx)
-        #         invalid_taxonomic_records.append({
-        #             "row_index": idx,
-        #             "family": str(family) if family else "",
-        #             "genus": str(genus) if genus else "",
-        #             "species": str(species) if species else "",
-        #             "error": error_msg
-        #         })
-        #
-        # if taxonomic_issues:
-        #     validation_result["issues"].append({
-        #         "type": "taxonomic_format",
-        #         "description": "Taxonomic name format invalid",
-        #         "count": len(taxonomic_issues),
-        #         "examples": [
-        #             f"Row {r['row_index'] + 2}: {r['family']} {r['genus']} {r['species']} - {r['error']}"
-        #             for r in invalid_taxonomic_records[:3]
-        #         ],
-        #         "invalidIndices": taxonomic_issues,
-        #         "invalidRecords": invalid_taxonomic_records
-        #     })
-
-        # 3. 批量匹配分类学名称
+        # 2. 批量匹配分类学名称 - 使用物种验证器
         taxonomic_data = []
         for idx, row in df.iterrows():
-            # Process all records instead of filtering by taxonomic_issues
             family = row.get(mappings["family"]) if mappings.get("family") else ""
             genus = row.get(mappings["genus"]) if mappings.get("genus") else ""
             species = row.get(mappings["species"]) if mappings.get("species") else ""
@@ -302,16 +259,21 @@ async def validate_mapping(mapping_data: ImportMappingModel):
             )
 
             if "error" not in matching_result:
-                # 重新整理匹配结果，添加原始行索引
+                # 重新整理匹配结果，添加原始行索引和详细信息
                 matches = matching_result["matches"]
                 for match_type in matches:
                     for match in matches[match_type]:
                         original_idx = match["import_index"]
                         match["row_index"] = taxonomic_data[original_idx]["row_index"]
 
+                        # 添加详细的匹配信息供后续使用
+                        match["original_family"] = taxonomic_data[original_idx]["family"]
+                        match["original_genus"] = taxonomic_data[original_idx]["genus"]
+                        match["original_species"] = taxonomic_data[original_idx]["species"]
+
                 validation_result["speciesMatching"] = matching_result
 
-        # 4. 验证数值字段
+        # 3. 验证数值字段
         numeric_fields = ["totalNumber"]
         for field_key in numeric_fields:
             if field_key in mappings and mappings[field_key]:
@@ -334,7 +296,7 @@ async def validate_mapping(mapping_data: ImportMappingModel):
                         "invalidIndices": invalid_numeric
                     })
 
-        # 5. 验证日期格式
+        # 4. 验证日期格式
         if "collectionDate" in mappings and mappings["collectionDate"]:
             date_column = mappings["collectionDate"]
             invalid_dates = []
@@ -387,6 +349,7 @@ async def validate_mapping(mapping_data: ImportMappingModel):
             data={},
             message=f"Validation failed: {str(e)}"
         )
+
 def convert_numpy_types(obj):
     if isinstance(obj, dict):
         return {k: convert_numpy_types(v) for k, v in obj.items()}
@@ -620,7 +583,7 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
 async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: Optional[int] = None):
     """
     处理verbatim导入（保存原始数据到verbatim表，用户后续验证）
-    源数据格式相同，但会将所有原始信息存储到verbatim表中
+    源数据格式相同，但会将所有原始信息存储到verbatim表中，包含物种匹配信息
     """
     try:
         # 获取导入信息
@@ -634,6 +597,43 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
         else:
             df = pd.read_excel(file_path)
 
+        # 获取物种匹配结果
+        species_matching = validation_result.get("speciesMatching", {})
+        all_matches = {}
+
+        # 整理所有类型的匹配结果
+        for match_type, matches in species_matching.get("matches", {}).items():
+            for match in matches:
+                row_idx = match.get("row_index")
+                if row_idx is not None:
+                    # 提取匹配信息
+                    match_info = {
+                        "match_type": match_type,
+                        "import_name": match.get("import_name", ""),
+                        "db_name": match.get("db_name", ""),
+                        "similarity": match.get("similarity", match.get("confidence", 0)),
+                        "normalized_name": match.get("import_normalized", ""),
+                        "db_normalized": match.get("db_normalized", "")
+                    }
+
+                    if match_type == "phonetic" and match.get("potential_matches"):
+                        # 对于语音匹配，取第一个潜在匹配
+                        potential = match["potential_matches"][0]
+                        match_info.update({
+                            "db_name": potential.get("db_name", ""),
+                            "db_normalized": potential.get("db_normalized", "")
+                        })
+
+                    all_matches[row_idx] = {
+                        "matched": match_type != "no_match",
+                        "taxon_id": match.get("taxon_id") if match_type != "phonetic" else (
+                            match["potential_matches"][0].get("taxon_id") if match.get("potential_matches") else None
+                        ),
+                        "match_status": match_type,
+                        "confidence": match.get("similarity", match.get("confidence", 0)),
+                        "match_info": match_info
+                    }
+
         # verbatim导入包含所有记录，即使验证失败的记录也会导入
         valid_records = []
         verbatim_taxonomic_records = []
@@ -641,7 +641,16 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
         total_numbers = []
 
         for index, row in df.iterrows():
-            # 1. 准备verbatim taxonomic记录 - 存储原始的分类学信息
+            # 获取物种匹配结果
+            match_result = all_matches.get(index, {
+                "matched": False,
+                "taxon_id": None,
+                "match_status": "no_match",
+                "confidence": 0,
+                "match_info": None
+            })
+
+            # 1. 准备verbatim taxonomic记录 - 存储原始的分类学信息和匹配结果
             family_value = row.get(mappings.get("family", ""), "") if mappings.get("family") else ""
             genus_value = row.get(mappings.get("genus", ""), "") if mappings.get("genus") else ""
             species_value = row.get(mappings.get("species", ""), "") if mappings.get("species") else ""
@@ -653,7 +662,12 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                     species_value).strip() else None,
                 "verbatim_subspecies": None,  # 目前不支持亚种
                 "original_text": f"{family_value} {genus_value} {species_value}".strip() if any(
-                    [family_value, genus_value, species_value]) else None
+                    [family_value, genus_value, species_value]) else None,
+                # 添加匹配信息
+                "match_status": match_result["match_status"],
+                "matched_taxon_id": match_result["taxon_id"],
+                "match_confidence": match_result["confidence"],
+                "match_info": match_result["match_info"]
             }
 
             # 2. 准备verbatim locality记录 - 存储原始的地点信息
@@ -706,14 +720,13 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "taxon_id": None,  # verbatim模式下不自动关联taxonomic表
                 "collection_date": None,
                 "locality_id": None,
-                # "field_number": None,
                 "total_number": 1,
                 "storage": None,
                 "jar_size": None,
                 "prev_number": None,
                 "inventory": None,
                 "remarks": "Imported via batch import - verbatim mode",
-                "match_type": "verbatim_pending"  # 标记为待人工验证
+                "match_type": match_result["match_status"]  # 使用实际的匹配状态
             }
 
             # 映射其他标准字段到Primary记录
@@ -730,8 +743,6 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         record["collection_date"] = formatted_date if is_valid else None
                     elif field == "localityId":
                         record["locality_id"] = value if not pd.isna(value) else None
-                    # elif field == "fieldNumber":
-                    #     record["field_number"] = str(value) if not pd.isna(value) else None
                     elif field == "totalNumber":
                         try:
                             record["total_number"] = int(float(value)) if not pd.isna(value) else 1
@@ -769,12 +780,6 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             record["verbatim_taxonomic_id"] = verbatim_taxonomic_ids[i] if i < len(verbatim_taxonomic_ids) else None
             record["verbatim_locality_id"] = verbatim_locality_ids[i] if i < len(verbatim_locality_ids) else None
 
-            # # 如果没有字段编号，生成一个
-            # if not record["field_number"]:
-            #     record["field_number"] = validation_utils.generate_field_number(
-            #         sequence=i + 1
-            #     )
-
         # 7. 插入Primary记录
         print(f"插入 {len(valid_records)} 条 Primary 记录...")
         primary_ids = await db_utils.insert_primary_records(valid_records, batch_serial_id)
@@ -797,7 +802,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             "preparationIds": prep_ids,
             "verbatimTaxonomicIds": verbatim_taxonomic_ids,
             "verbatimLocalityIds": verbatim_locality_ids,
-            "note": "Records imported in verbatim mode - all original data preserved in verbatim tables for manual review"
+            "note": "Records imported in verbatim mode - all original data and matching results preserved in verbatim tables for manual review"
         })
 
         # 10. 清理临时文件

@@ -334,10 +334,10 @@ async def get_batch_records(
 ):
     """
     Get all records for a specific batch with pagination and filtering
-    获取指定批次的所有记录，支持分页和筛选
+    获取指定批次的所有记录，支持分页和筛选，包含物种匹配信息
     """
     try:
-        # Base query - Modified to join with locality tables to get field_number
+        # Base query - Modified to join with locality tables and include matching information
         base_query = """
         SELECT 
             p."PrimaryID",
@@ -354,21 +354,30 @@ async def get_batch_records(
             p."Remarks",
             p."TimeStampModified",
             p."review_flag",
+            p."match_type",
             vt."verbatim_family",
             vt."verbatim_genus", 
             vt."verbatim_species",
+            vt."match_status",
+            vt."matched_taxon_id",
+            vt."match_confidence",
+            vt."match_details",
             vl."verbatim_locality_string",
             vl."verbatim_fieldno" as verbatim_field_number,
             vl."verbatim_collect_date" as verbatim_collect_date,
             t."Genus" as matched_genus,
             t."Species" as matched_species,
             l."LocalityString" as matched_locality,
-            l."FieldNo" as matched_field_number
+            l."FieldNo" as matched_field_number,
+            -- 如果有匹配建议但未实际应用，从 verbatim 表获取建议的分类信息
+            suggested_t."Genus" as suggested_genus,
+            suggested_t."Species" as suggested_species
         FROM "Primary" p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
         LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
         LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
+        LEFT JOIN "TaxonomicTable" suggested_t ON vt."matched_taxon_id" = suggested_t."TaxonID"
         WHERE p.batch_serial_id = $1
         """
 
@@ -394,11 +403,13 @@ async def get_batch_records(
                 where_clauses.append('("TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL)')
             elif filter_params.status == 'needs_review':
                 where_clauses.append('review_flag = true')
+            elif filter_params.status == 'has_match_suggestion':
+                where_clauses.append('vt."matched_taxon_id" IS NOT NULL')
 
         if filter_params.search:
             where_clauses.append(f"""(
                 "CatalogNumber"::text ILIKE ${param_index} OR
-                vl."field_no" ILIKE ${param_index} OR
+                vl."verbatim_fieldno" ILIKE ${param_index} OR
                 l."FieldNo" ILIKE ${param_index} OR
                 vt."verbatim_genus" ILIKE ${param_index} OR
                 vt."verbatim_species" ILIKE ${param_index} OR
@@ -432,6 +443,14 @@ async def get_batch_records(
             locality_status = "processed" if record["Locality1ID"] is not None else "pending"
             overall_status = "completed" if taxonomic_status == "processed" and locality_status == "processed" else "in_progress"
 
+            # Parse match details if available
+            match_details = None
+            if record["match_details"]:
+                try:
+                    match_details = json.loads(record["match_details"]) if isinstance(record["match_details"], str) else record["match_details"]
+                except:
+                    match_details = None
+
             # Format the record
             formatted_record = {
                 "id": record["PrimaryID"],
@@ -452,7 +471,7 @@ async def get_batch_records(
                     "locality": {
                         "id": record["verbatim_localityid"],
                         "locality_string": record["verbatim_locality_string"],
-                        "field_number": record["verbatim_field_number"]  # Added field_number from verbatim_locality
+                        "field_number": record["verbatim_field_number"]
                     }
                 },
                 "matched_data": {
@@ -460,15 +479,33 @@ async def get_batch_records(
                         "id": record["TaxonID"],
                         # "family": record["matched_family"],
                         "genus": record["matched_genus"],
-                        "species": record["matched_species"]
+                        "species": record["matched_species"],
+                        # "author": record["matched_author"],
+                        # "full_name": record["matched_full_name"]
                     },
                     "locality": {
                         "id": record["Locality1ID"],
                         "locality": record["matched_locality"],
                         "field_number": record["matched_field_number"],
                         "collection_date": record["verbatim_collect_date"].isoformat() if record[
-                            "verbatim_collect_date"] else None,
-                        # Added field_number from the matched locality
+                            "verbatim_collect_date"] else None
+                    }
+                },
+                "match_suggestions": {
+                    "taxonomic": {
+                        "status": record["match_status"],
+                        "confidence": record["match_confidence"],
+                        "suggested_taxon_id": record["matched_taxon_id"],
+                        "suggested_data": {
+                            # "family": record["suggested_family"],
+                            "genus": record["suggested_genus"],
+                            "species": record["suggested_species"],
+                            # "author": record["suggested_author"],
+                            # "full_name": record["suggested_full_name"]
+                        } if record["suggested_genus"] or record["suggested_species"] else None,
+                        "match_details": match_details,
+                        "has_suggestion": record["matched_taxon_id"] is not None,
+                        "suggestion_applied": record["TaxonID"] == record["matched_taxon_id"] if record["matched_taxon_id"] else False
                     }
                 },
                 "record_data": {
@@ -478,7 +515,8 @@ async def get_batch_records(
                     "prev_number": record["PrevNumber"],
                     "inventory": record["Inventory"],
                     "remarks": record["Remarks"],
-                    "last_modified": record["TimeStampModified"].isoformat() if record["TimeStampModified"] else None
+                    "last_modified": record["TimeStampModified"].isoformat() if record["TimeStampModified"] else None,
+                    "match_type": record["match_type"]
                 }
             }
 
@@ -492,9 +530,11 @@ async def get_batch_records(
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed
-        FROM "Primary"
-        WHERE batch_serial_id = $1
+            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN vt."matched_taxon_id" IS NOT NULL THEN 1 ELSE 0 END) as has_taxonomic_suggestions
+        FROM "Primary" p
+        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
+        WHERE p.batch_serial_id = $1
         """
 
         progress_result = await execute_query(progress_query, batch_serial_id)
@@ -505,7 +545,9 @@ async def get_batch_records(
             progress = {
                 "taxonomic": {
                     "processed": progress_data["taxonomic_processed"],
-                    "percent": round((progress_data["taxonomic_processed"] / total) * 100, 1) if total > 0 else 0
+                    "percent": round((progress_data["taxonomic_processed"] / total) * 100, 1) if total > 0 else 0,
+                    "has_suggestions": progress_data["has_taxonomic_suggestions"],
+                    "suggestions_percent": round((progress_data["has_taxonomic_suggestions"] / total) * 100, 1) if total > 0 else 0
                 },
                 "locality": {
                     "processed": progress_data["locality_processed"],
@@ -2014,216 +2056,4 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
         return ResponseModel(
             code=50000,
             message=f"Failed to get verbatim statistics: {str(e)}"
-        )
-
-
-# Helper function to generate field numbers - Modified to update in locality table
-@router.post("/generate-field-number", response_model=ResponseModel)
-async def generate_field_number():
-    """
-    Generate a new field number
-    生成新的字段编号
-    """
-    try:
-        # Generate a field number based on current date and a sequence
-        current_date = datetime.now().strftime("%Y%m%d")
-
-        # Get the current sequence for today from locality table
-        query = """
-        SELECT MAX(CAST(SUBSTRING("FieldNumber" FROM LENGTH("FieldNumber") - 2) AS INTEGER)) as max_seq
-        FROM locality
-        WHERE "FieldNumber" LIKE $1 || '%'
-        """
-
-        result = await execute_query(query, current_date)
-
-        max_seq = result[0]['max_seq'] if result and result[0]['max_seq'] is not None else 0
-        next_seq = max_seq + 1
-
-        field_number = f"FN-{current_date}-{next_seq:03d}"
-
-        return ResponseModel(
-            code=20000,
-            data={
-                "field_number": field_number
-            }
-        )
-    except Exception as e:
-        return ResponseModel(
-            code=50000,
-            message=f"Failed to generate field number: {str(e)}"
-        )
-
-
-# Add endpoints to update field numbers separately
-@router.put("/locality/field-number", response_model=ResponseModel)
-async def update_field_number(data: Dict[str, Any]):
-    """
-    Update field number for a locality record
-    更新地点记录的字段编号
-    """
-    try:
-        # Validate required fields
-        if "locality_id" not in data:
-            return ResponseModel(
-                code=40000,
-                message="locality_id is required"
-            )
-
-        if "field_number" not in data:
-            return ResponseModel(
-                code=40000,
-                message="field_number is required"
-            )
-
-        # Update the field number in the locality table
-        update_query = """
-        UPDATE locality
-        SET "FieldNumber" = $1, "TimeStampModified" = $2
-        WHERE "LocalityID" = $3
-        RETURNING "LocalityID"
-        """
-
-        result = await execute_query(
-            update_query,
-            data["field_number"],
-            datetime.now(),
-            data["locality_id"]
-        )
-
-        if not result:
-            return ResponseModel(
-                code=40400,
-                message=f"Locality with ID {data['locality_id']} not found"
-            )
-
-        return ResponseModel(
-            code=20000,
-            data={
-                "locality_id": data["locality_id"],
-                "field_number": data["field_number"],
-                "message": "Field number updated successfully"
-            }
-        )
-    except Exception as e:
-        return ResponseModel(
-            code=50000,
-            message=f"Failed to update field number: {str(e)}"
-        )
-
-
-@router.put("/verbatim/locality/field-number", response_model=ResponseModel)
-async def update_verbatim_field_number(data: Dict[str, Any]):
-    """
-    Update field number for a verbatim locality record
-    更新verbatim地点记录的字段编号
-    """
-    try:
-        # Validate required fields
-        if "verbatim_locality_id" not in data:
-            return ResponseModel(
-                code=40000,
-                message="verbatim_locality_id is required"
-            )
-
-        if "field_number" not in data:
-            return ResponseModel(
-                code=40000,
-                message="field_number is required"
-            )
-
-        # Update the field number in the verbatim_locality table
-        update_query = """
-        UPDATE verbatim_locality
-        SET "field_number" = $1, "TimeStampModified" = $2
-        WHERE "verbatim_localityid" = $3
-        RETURNING "verbatim_localityid"
-        """
-
-        result = await execute_query(
-            update_query,
-            data["field_number"],
-            datetime.now(),
-            data["verbatim_locality_id"]
-        )
-
-        if not result:
-            return ResponseModel(
-                code=40400,
-                message=f"Verbatim locality with ID {data['verbatim_locality_id']} not found"
-            )
-
-        return ResponseModel(
-            code=20000,
-            data={
-                "verbatim_locality_id": data["verbatim_locality_id"],
-                "field_number": data["field_number"],
-                "message": "Field number updated successfully"
-            }
-        )
-    except Exception as e:
-        return ResponseModel(
-            code=50000,
-            message=f"Failed to update field number: {str(e)}"
-        )
-
-
-# Add an endpoint to get field numbers used within a batch
-@router.get("/batches/{batch_serial_id}/field-numbers", response_model=ResponseModel)
-async def get_batch_field_numbers(batch_serial_id: str):
-    """
-    Get all field numbers used within a batch
-    获取批次内使用的所有字段编号
-    """
-    try:
-        # Query field numbers from both verbatim_locality and matched locality
-        query = """
-        SELECT 
-            p."PrimaryID",
-            p."CatalogNumber",
-            vl."field_number" as verbatim_field_number,
-            l."FieldNumber" as matched_field_number
-        FROM "Primary" p
-        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
-        LEFT JOIN locality l ON p."LocalityID" = l."LocalityID"
-        WHERE p.batch_serial_id = $1
-        """
-
-        result = await execute_query(query, batch_serial_id)
-
-        if not result:
-            return ResponseModel(
-                code=40400,
-                message=f"Batch with serial ID {batch_serial_id} not found or has no records"
-            )
-
-        # Format the result
-        field_numbers = []
-        for record in result:
-            field_number = record["matched_field_number"] or record["verbatim_field_number"]
-            if field_number:
-                field_numbers.append({
-                    "primary_id": record["PrimaryID"],
-                    "catalog_number": record["CatalogNumber"],
-                    "field_number": field_number,
-                    "source": "matched" if record["matched_field_number"] else "verbatim"
-                })
-
-        # Count unique field numbers
-        unique_field_numbers = list(set([f["field_number"] for f in field_numbers]))
-
-        return ResponseModel(
-            code=20000,
-            data={
-                "batch_serial_id": batch_serial_id,
-                "total_records": len(result),
-                "records_with_field_number": len(field_numbers),
-                "unique_field_numbers": len(unique_field_numbers),
-                "field_numbers": field_numbers
-            }
-        )
-    except Exception as e:
-        return ResponseModel(
-            code=50000,
-            message=f"Failed to get batch field numbers: {str(e)}"
         )

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from app.db.database import execute_query, execute_mutation, execute_transaction
@@ -95,10 +96,12 @@ class DatabaseUtils:
             print(f"Error generating batch serial ID: {str(e)}")
             raise
 
+    # 在 paste-3.txt 中修改 insert_verbatim_taxonomic_records 方法
+
     @staticmethod
     async def insert_verbatim_taxonomic_records(records: List[Dict]) -> List[int]:
         """
-        批量插入 verbatim_taxonomic 记录
+        批量插入 verbatim_taxonomic 记录，包含匹配信息
         返回插入的 verbatim_taxonomic_id 列表
         """
         if not records:
@@ -109,16 +112,26 @@ class DatabaseUtils:
         for record in records:
             insert_sql = """
             INSERT INTO verbatim_taxonomic (
-                "verbatim_family", "verbatim_genus", "verbatim_species"
+                "verbatim_family", "verbatim_genus", "verbatim_species", 
+                "match_status", "matched_taxon_id", "match_confidence", "match_details"
             ) VALUES (
-                $1, $2, $3
+                $1, $2, $3, $4, $5, $6, $7
             ) RETURNING "verbatim_taxonid"
             """
+
+            # 准备匹配详情的 JSON 数据
+            match_details = None
+            if record.get("match_info"):
+                match_details = json.dumps(record["match_info"])
 
             params = [
                 record.get("verbatim_family"),
                 record.get("verbatim_genus"),
-                record.get("verbatim_species")
+                record.get("verbatim_species"),
+                record.get("match_status", "no_match"),
+                record.get("matched_taxon_id"),
+                record.get("match_confidence"),
+                match_details
             ]
 
             statements.append({
@@ -140,6 +153,7 @@ class DatabaseUtils:
             print(f"Error inserting verbatim taxonomic records: {str(e)}")
             raise
 
+
     @staticmethod
     async def insert_verbatim_locality_records(records: List[Dict]) -> List[int]:
         """
@@ -158,7 +172,7 @@ class DatabaseUtils:
                 "verbatim_state", "verbatim_county", "verbatim_waterbody", 
                 "verbatim_lat", "verbatim_lon","verbatim_collect_date","verbatim_collector","verbatim_fieldno"
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
             ) RETURNING "verbatim_localityid"
             """
 
