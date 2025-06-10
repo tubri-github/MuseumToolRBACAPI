@@ -362,9 +362,18 @@ async def get_batch_records(
             vt."matched_taxon_id",
             vt."match_confidence",
             vt."match_details",
+            -- 补充完整的 verbatim_locality 字段
             vl."verbatim_locality_string",
             vl."verbatim_fieldno" as verbatim_field_number,
+            vl."verbatim_drainage",
+            vl."verbatim_country",
+            vl."verbatim_state", 
+            vl."verbatim_county",
+            vl."verbatim_waterbody",
+            vl."verbatim_lat",
+            vl."verbatim_lon",
             vl."verbatim_collect_date" as verbatim_collect_date,
+            vl."verbatim_collector",
             t."Genus" as matched_genus,
             t."Species" as matched_species,
             l."LocalityString" as matched_locality,
@@ -471,17 +480,25 @@ async def get_batch_records(
                     "locality": {
                         "id": record["verbatim_localityid"],
                         "locality_string": record["verbatim_locality_string"],
-                        "field_number": record["verbatim_field_number"]
+                        "field_number": record["verbatim_field_number"],
+                        # 补充以下字段
+                        "drainage": record["verbatim_drainage"],
+                        "country": record["verbatim_country"],
+                        "state": record["verbatim_state"],
+                        "county": record["verbatim_county"],
+                        "waterbody": record["verbatim_waterbody"],
+                        "latitude": record["verbatim_lat"],
+                        "longitude": record["verbatim_lon"],
+                        "collect_date": record["verbatim_collect_date"].isoformat() if record[
+                            "verbatim_collect_date"] else None,
+                        "collector": record["verbatim_collector"]
                     }
                 },
                 "matched_data": {
                     "taxonomic": {
                         "id": record["TaxonID"],
-                        # "family": record["matched_family"],
                         "genus": record["matched_genus"],
                         "species": record["matched_species"],
-                        # "author": record["matched_author"],
-                        # "full_name": record["matched_full_name"]
                     },
                     "locality": {
                         "id": record["Locality1ID"],
@@ -497,15 +514,13 @@ async def get_batch_records(
                         "confidence": record["match_confidence"],
                         "suggested_taxon_id": record["matched_taxon_id"],
                         "suggested_data": {
-                            # "family": record["suggested_family"],
                             "genus": record["suggested_genus"],
                             "species": record["suggested_species"],
-                            # "author": record["suggested_author"],
-                            # "full_name": record["suggested_full_name"]
                         } if record["suggested_genus"] or record["suggested_species"] else None,
                         "match_details": match_details,
                         "has_suggestion": record["matched_taxon_id"] is not None,
-                        "suggestion_applied": record["TaxonID"] == record["matched_taxon_id"] if record["matched_taxon_id"] else False
+                        "suggestion_applied": record["TaxonID"] == record["matched_taxon_id"] if record[
+                            "matched_taxon_id"] else False
                     }
                 },
                 "record_data": {
@@ -517,7 +532,9 @@ async def get_batch_records(
                     "remarks": record["Remarks"],
                     "last_modified": record["TimeStampModified"].isoformat() if record["TimeStampModified"] else None,
                     "match_type": record["match_type"]
-                }
+                },
+                # Store the original API record for reference
+                "_apiData": record
             }
 
             records.append(formatted_record)
@@ -756,9 +773,22 @@ async def get_verbatim_locality(verbatim_locality_id: int):
     获取verbatim locality数据，包括原始的地点信息
     """
     try:
-        # Updated query to include field_number
+        # 修改查询以包含所有字段
         query = """
-        SELECT * 
+        SELECT 
+            "verbatim_localityid",
+            "verbatim_locality_string",
+            "verbatim_drainage",
+            "verbatim_country",
+            "verbatim_state",
+            "verbatim_county",
+            "verbatim_waterbody",
+            "verbatim_lat",
+            "verbatim_lon",
+            "verbatim_collect_date",
+            "verbatim_collector",
+            "verbatim_fieldno",
+            "original_text"
         FROM verbatim_locality
         WHERE "verbatim_localityid" = $1
         """
@@ -771,7 +801,7 @@ async def get_verbatim_locality(verbatim_locality_id: int):
                 message=f"Verbatim locality data with ID {verbatim_locality_id} not found"
             )
 
-        # Format response - added field_number
+        # 格式化完整的响应数据
         verbatim_data = {
             "verbatim_localityid": result[0]["verbatim_localityid"],
             "verbatim_locality_string": result[0]["verbatim_locality_string"],
@@ -782,10 +812,9 @@ async def get_verbatim_locality(verbatim_locality_id: int):
             "verbatim_waterbody": result[0]["verbatim_waterbody"],
             "verbatim_lat": result[0]["verbatim_lat"],
             "verbatim_lon": result[0]["verbatim_lon"],
-            "verbatim_collect_date": result[0]["verbatim_collect_date"].isoformat() if result[0][
-                "verbatim_collect_date"] else None,
+            "verbatim_collect_date": result[0]["verbatim_collect_date"].isoformat() if result[0]["verbatim_collect_date"] else None,
             "verbatim_collector": result[0]["verbatim_collector"],
-            "field_number": result[0]["field_number"],  # Added field_number
+            "verbatim_fieldno": result[0]["verbatim_fieldno"],  # 对应 field_number
             "original_text": result[0]["original_text"]
         }
 
@@ -817,7 +846,6 @@ async def get_verbatim_locality(verbatim_locality_id: int):
             code=50000,
             message=f"Failed to get verbatim locality data: {str(e)}"
         )
-
 
 @router.post("/locality/auto-match", response_model=ResponseModel)
 async def auto_match_locality(verbatim_data: VerbatimLocalityModel):

@@ -694,7 +694,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "waterbody": "verbatim_waterbody",
                 "latitude": "verbatim_latitude",
                 "longitude": "verbatim_longitude",
-                "field_number": "verbatim_fieldno"
+                "fieldNumber": "verbatim_fieldno"
             }
 
             locality_parts = []
