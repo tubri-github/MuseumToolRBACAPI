@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin, data_file_processor, batch_review
 from app.db.elasticsearch import init_es, close_es
+from app.middleware.request_logging import RequestLoggingMiddleware
 
 app = FastAPI(
     title="Fisheries Database API",
@@ -18,6 +19,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(
+    RequestLoggingMiddleware,
+    log_dir="logs",
+    max_file_size=50 * 1024 * 1024,  # 50MB
+    backup_count=10,
+    exclude_paths=["/docs", "/redoc", "/openapi.json", "/favicon.ico", "/metrics"],
+    log_format="json",
+    log_request_body=False  # 设为False避免影响PUT请求性能
+)
+
 
 # Include routers from different modules
 app.include_router(login.router, prefix="/api/login", tags=["Login"])
