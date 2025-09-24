@@ -127,14 +127,6 @@ class ImportValidationUtils:
         result = await execute_query(query, limit)
         return [str(row["Locality1ID"]) for row in result] if result else []
 
-    @staticmethod
-    def generate_field_number(prefix="ULM", date_obj=None, sequence=1) -> str:
-        """生成字段编号"""
-        if date_obj is None:
-            date_obj = datetime.now()
-
-        date_str = date_obj.strftime("%Y%m%d")
-        return f"{prefix}-{date_str}-{sequence:04d}"
 
     @staticmethod
     def sanitize_scientific_name(name_str) -> str:

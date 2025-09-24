@@ -56,4 +56,8 @@ async def shutdown_db_client():
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Fisheries Database API"}
+    return {"message": "Welcome to the FMMT (Fish Management and Monitoring Tool) API"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)

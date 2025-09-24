@@ -499,8 +499,6 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
                         if field == "collectionDate":
                             is_valid, formatted_date = validation_utils.validate_date(value)
                             record["collection_date"] = formatted_date if is_valid else None
-                        elif field == "localityId":
-                            record["locality_id"] = value if not pd.isna(value) else None
                         # elif field == "fieldNumber":
                         #     record["field_number"] = str(value) if not pd.isna(value) else None
                         elif field == "totalNumber":
@@ -540,11 +538,6 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
         for i, record in enumerate(valid_records):
             record["catalog_number"] = catalog_numbers[i]
 
-            # # 如果没有字段编号，生成一个
-            # if not record["field_number"]:
-            #     record["field_number"] = validation_utils.generate_field_number(
-            #         sequence=i + 1
-            #     )
 
         # 插入Primary记录
         primary_ids = await db_utils.insert_primary_records(valid_records, batch_serial_id)
@@ -741,8 +734,6 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                     if field == "collectionDate":
                         is_valid, formatted_date = validation_utils.validate_date(value)
                         record["collection_date"] = formatted_date if is_valid else None
-                    elif field == "localityId":
-                        record["locality_id"] = value if not pd.isna(value) else None
                     elif field == "totalNumber":
                         try:
                             record["total_number"] = int(float(value)) if not pd.isna(value) else 1
@@ -860,8 +851,7 @@ async def download_template():
                 "Genus": ["Cyprinus", "Salmo", "Format: Capitalized genus name"],
                 "Species": ["carpio", "trutta", "Format: lowercase species name"],
                 "Collection_Date": ["2025-02-15", "2025-03-20", "Format: YYYY-MM-DD"],
-                "Locality_ID": ["1", "2", "Must be a valid Locality1ID from the system"],
-                "Field_Number": ["FIELD-001", "FIELD-002", "Optional - auto-generated if empty"],
+                "Field_Number": ["FIELD-001", "FIELD-002", "Optional - field collection number"],
                 "Total_Number": ["1", "2", "Required - number of specimens"],
                 "Storage": ["Tank A1", "Tank B2", "Optional"],
                 "Jar_Size": ["Large", "Medium", "Optional"],
@@ -872,6 +862,8 @@ async def download_template():
                 "Country": ["USA", "Canada", "Optional"],
                 "State": ["Michigan", "Ontario", "Optional"],
                 "County": ["Wayne", "Essex", "Optional"],
+                "Drainage": ["Great Lakes Basin", "Mississippi River", "Optional - drainage basin information"],
+                "Waterbody": ["Lake Huron", "St. Clair River", "Optional - water body name (lake, river, etc.)"],
                 "Latitude": ["42.3314", "42.2808", "Optional - decimal degrees"],
                 "Longitude": ["-83.0458", "-82.9534", "Optional - decimal degrees"]
             })
