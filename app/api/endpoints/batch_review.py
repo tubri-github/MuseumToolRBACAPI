@@ -351,16 +351,16 @@ async def get_batch_records(
     try:
         # Base query - 只在SELECT中添加验证状态字段，其他保持不变
         base_query = """
-        SELECT 
+        SELECT
             p."PrimaryID",
             p."CatalogNumber",
             p."verbatim_taxonid",
-            p."verbatim_localityid", 
+            p."verbatim_localityid",
             p."TaxonID",
             p."Locality1ID",
             p."TotalNumber",
             p."Storage",
-            p."JarSize", 
+            p."JarSize",
             p."PrevNumber",
             p."Inventory",
             p."Remarks",
@@ -372,6 +372,7 @@ async def get_batch_records(
             p."record_verification_status",
             p."overall_verification_status",
             p."verification_notes",
+            p."verification_warnings",
             vt."verbatim_family",
             vt."verbatim_genus", 
             vt."verbatim_species",
@@ -407,8 +408,10 @@ async def get_batch_records(
 
         count_query = """
         SELECT COUNT(*) as count
-        FROM primary_temp
-        WHERE batch_serial_id = $1
+        FROM primary_temp p
+        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
+        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+        WHERE p.batch_serial_id = $1
         """
 
         # Add filters if provided - 添加新的验证状态过滤选项
@@ -418,19 +421,23 @@ async def get_batch_records(
 
         if filter_params.status:
             if filter_params.status == 'pending_taxonomic':
-                where_clauses.append('p."species_verification_status" = \'pending\'')
+                where_clauses.append('COALESCE(p."species_verification_status", \'pending\') = \'pending\'')
             elif filter_params.status == 'pending_locality':
-                where_clauses.append('p."locality_verification_status" = \'pending\'')
+                where_clauses.append('COALESCE(p."locality_verification_status", \'pending\') = \'pending\'')
             elif filter_params.status == 'pending_record':
-                where_clauses.append('p."record_verification_status" = \'pending\'')
+                where_clauses.append('COALESCE(p."record_verification_status", \'pending\') = \'pending\'')
             elif filter_params.status == 'pending_any':
                 where_clauses.append('(p."TaxonID" IS NULL OR p."Locality1ID" IS NULL)')
             elif filter_params.status == 'completed':
-                where_clauses.append('p."overall_verification_status" = \'completed\'')
+                where_clauses.append('COALESCE(p."overall_verification_status", \'pending\') = \'completed\'')
             elif filter_params.status == 'needs_review':
                 where_clauses.append('p."review_flag" = true')
             elif filter_params.status == 'has_match_suggestion':
                 where_clauses.append('vt."matched_taxon_id" IS NOT NULL')
+            elif filter_params.status == 'has_errors':
+                where_clauses.append("(p.\"verification_warnings\" IS NOT NULL AND p.\"verification_warnings\" != '[]' AND p.\"verification_warnings\" LIKE '%\"severity\": \"error\"%')")
+            elif filter_params.status == 'has_warnings':
+                where_clauses.append("(p.\"verification_warnings\" IS NOT NULL AND p.\"verification_warnings\" != '[]' AND p.\"verification_warnings\" LIKE '%\"severity\": \"warning\"%')")
 
         if filter_params.search:
             where_clauses.append(f"""(
@@ -501,7 +508,8 @@ async def get_batch_records(
                     "overall": {
                         "status": record.get("overall_verification_status", "pending")
                     },
-                    "notes": record.get("verification_notes")
+                    "notes": record.get("verification_notes"),
+                    "warnings": json.loads(record["verification_warnings"]) if record.get("verification_warnings") else []
                 },
                 "verbatim_data": {
                     "taxonomic": {
@@ -1529,6 +1537,9 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
             datetime.now()
         )
 
+        # Re-validate the record after update to check if warnings are still valid
+        await revalidate_single_record(record_id)
+
         return ResponseModel(
             code=20000,
             data={
@@ -2328,3 +2339,132 @@ async def apply_taxonomic_suggestion(record_id: int):
             code=50000,
             message=f"Failed to apply taxonomic suggestion: {str(e)}"
         )
+
+
+# Helper function to revalidate a single record after update
+async def revalidate_single_record(record_id: int):
+    """
+    重新验证单个记录的warnings，在记录更新后调用
+    检查：
+    1. TotalNumber 是否为有效数字
+    2. Storage 是否有效
+    3. 其他 record details 字段
+    移除已修复的warnings，保留仍存在的warnings
+    """
+    try:
+        # 查询记录当前数据
+        query = """
+        SELECT
+            p."PrimaryID",
+            p."TotalNumber",
+            p."Storage",
+            p."JarSize",
+            p."PrevNumber",
+            p."Inventory",
+            p."verification_warnings",
+            p."TaxonID",
+            p."Locality1ID",
+            vl."verbatim_fieldno"
+        FROM primary_temp p
+        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+        WHERE p."PrimaryID" = $1
+        """
+
+        result = await execute_query(query, record_id)
+        if not result or len(result) == 0:
+            return
+
+        record = result[0]
+        new_warnings = []
+
+        # 验证 TotalNumber
+        total_number = record.get("TotalNumber")
+        if total_number is None or total_number == "":
+            new_warnings.append({
+                "field": "TotalNumber",
+                "issue_type": "missing_value",
+                "severity": "warning",
+                "message": "TotalNumber is empty, defaulted to 1"
+            })
+        elif not isinstance(total_number, (int, float)):
+            try:
+                int(total_number)
+            except (ValueError, TypeError):
+                new_warnings.append({
+                    "field": "TotalNumber",
+                    "issue_type": "data_type",
+                    "severity": "error",
+                    "message": f"TotalNumber value '{total_number}' is not a valid number"
+                })
+
+        # 验证 Storage
+        storage = record.get("Storage")
+        if storage is None or str(storage).strip() == "":
+            new_warnings.append({
+                "field": "Storage",
+                "issue_type": "missing_value",
+                "severity": "warning",
+                "message": "Storage location is empty"
+            })
+
+        # 验证 JarSize
+        jar_size = record.get("JarSize")
+        if jar_size is None or str(jar_size).strip() == "":
+            new_warnings.append({
+                "field": "JarSize",
+                "issue_type": "missing_value",
+                "severity": "warning",
+                "message": "Jar size is not specified"
+            })
+
+        # 根据warnings的存在情况设置 record_verification_status
+        has_errors = any(w.get("severity") == "error" for w in new_warnings)
+        record_status = "pending" if has_errors else "verified"
+
+        # 同时检查 species 和 locality 状态来计算 overall_status
+        species_status_query = """
+        SELECT
+            "species_verification_status",
+            "locality_verification_status"
+        FROM primary_temp
+        WHERE "PrimaryID" = $1
+        """
+        status_result = await execute_query(species_status_query, record_id)
+
+        if status_result:
+            species_status = status_result[0].get("species_verification_status", "pending")
+            locality_status = status_result[0].get("locality_verification_status", "pending")
+
+            if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+                overall_status = "completed"
+            else:
+                overall_status = "pending"
+        else:
+            overall_status = "pending"
+
+        # 更新记录的warnings和verification status
+        warnings_json = json.dumps(new_warnings) if new_warnings else None
+
+        update_query = """
+        UPDATE primary_temp
+        SET
+            "verification_warnings" = $1,
+            "record_verification_status" = $2,
+            "overall_verification_status" = $3,
+            "TimeStampModified" = NOW()
+        WHERE "PrimaryID" = $4
+        """
+
+        await execute_mutation(
+            update_query,
+            warnings_json,
+            record_status,
+            overall_status,
+            record_id
+        )
+
+        print(f"Re-validated record {record_id}: {len(new_warnings)} warnings, status={record_status}")
+
+    except Exception as e:
+        print(f"Error revalidating record {record_id}: {str(e)}")
+        # Don't raise exception, just log it - revalidation failure shouldn't block update

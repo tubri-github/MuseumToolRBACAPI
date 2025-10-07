@@ -424,6 +424,223 @@ async def confirm_import(import_data: ConfirmImportModel, background_tasks: Back
         )
 
 
+async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial_id: str):
+    """
+    自动验证导入的记录
+    规则:
+    1. 如果species name是exact match -> species_verification_status = 'verified'
+    2. 如果field number在locality1中找到exact match -> locality_verification_status = 'verified'
+    3. record details验证: 允许空值和轻微错误 -> record_verification_status = 'verified' (但记录warnings)
+    """
+    try:
+        from app.db.database import execute_transaction
+
+        # 批量查询所有需要验证的记录
+        query = """
+        SELECT
+            p."PrimaryID",
+            p."verbatim_taxonid",
+            p."verbatim_localityid",
+            p."TotalNumber",
+            p."Storage",
+            p."JarSize",
+            p."PrevNumber",
+            p."Inventory",
+            p."verification_warnings",
+            vt."match_status" as species_match_status,
+            vt."matched_taxon_id",
+            vl."verbatim_fieldno"
+        FROM primary_temp p
+        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
+        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+        WHERE p.batch_serial_id = $1
+        """
+
+        records = await execute_query(query, batch_serial_id)
+
+        if not records:
+            print(f"No records found for batch {batch_serial_id}")
+            return
+
+        # 为每条记录构建更新语句
+        update_statements = []
+
+        for record in records:
+            primary_id = record["PrimaryID"]
+            species_status = "pending"
+            locality_status = "pending"
+            record_status = "pending"
+            warnings = []
+
+            # 读取已有的import warnings
+            existing_warnings = []
+            if record.get("verification_warnings"):
+                try:
+                    existing_warnings = json.loads(record["verification_warnings"])
+                    if not isinstance(existing_warnings, list):
+                        existing_warnings = []
+                except:
+                    existing_warnings = []
+
+            # 1. 验证 species name (exact match 自动验证)
+            if record["species_match_status"] == "exact":
+                species_status = "verified"
+                print(f"Record {primary_id}: Species verified (exact match)")
+            else:
+                print(f"Record {primary_id}: Species pending (match_status: {record['species_match_status']})")
+
+            # 2. 验证 locality (field number exact match)
+            verbatim_fieldno = record.get("verbatim_fieldno")
+            if verbatim_fieldno:
+                # 查找locality1中是否有匹配的FieldNo
+                locality_query = """
+                SELECT "Locality1ID", "FieldNo"
+                FROM locality1
+                WHERE "FieldNo" = $1
+                LIMIT 1
+                """
+                locality_result = await execute_query(locality_query, verbatim_fieldno)
+
+                if locality_result and len(locality_result) > 0:
+                    locality_status = "verified"
+                    # 同时更新 Locality1ID
+                    locality_id = locality_result[0]["Locality1ID"]
+                    print(f"Record {primary_id}: Locality verified and linked (FieldNo: {verbatim_fieldno} -> Locality1ID: {locality_id})")
+
+                    # 添加更新Locality1ID的语句
+                    update_locality_sql = """
+                    UPDATE primary_temp
+                    SET "Locality1ID" = $1
+                    WHERE "PrimaryID" = $2
+                    """
+                    update_statements.append({
+                        "sql": update_locality_sql,
+                        "params": [locality_id, primary_id]
+                    })
+                else:
+                    print(f"Record {primary_id}: Locality pending (FieldNo not found: {verbatim_fieldno})")
+            else:
+                print(f"Record {primary_id}: Locality pending (no field number)")
+
+            # 3. 验证 record details (宽松验证:允许空值和minor errors)
+            record_warnings = []
+            record_warnings_detail = []  # 详细的warning信息，包含字段和类型
+
+            # 3.1 检查 TotalNumber - 必须是有效数字
+            total_number_value = record.get("TotalNumber")
+            if total_number_value is None or total_number_value == 0:
+                record_warnings.append("TotalNumber is missing or zero")
+                record_warnings_detail.append({
+                    "field": "TotalNumber",
+                    "issue_type": "empty_value",
+                    "severity": "warning",
+                    "message": "TotalNumber is missing or zero"
+                })
+            elif not isinstance(total_number_value, (int, float)) or total_number_value <= 0:
+                # 检查是否是有效的正数
+                record_warnings.append(f"TotalNumber has invalid value: {total_number_value}")
+                record_warnings_detail.append({
+                    "field": "TotalNumber",
+                    "issue_type": "invalid_type",
+                    "severity": "error",
+                    "message": f"TotalNumber must be a positive number, got: {total_number_value}"
+                })
+
+            # 3.2 检查其他字段空值
+            if not record.get("Storage"):
+                record_warnings.append("Storage is empty")
+                record_warnings_detail.append({
+                    "field": "Storage",
+                    "issue_type": "empty_value",
+                    "severity": "warning",
+                    "message": "Storage is empty"
+                })
+
+            if not record.get("PrevNumber"):
+                record_warnings.append("PrevNumber is empty")
+                record_warnings_detail.append({
+                    "field": "PrevNumber",
+                    "issue_type": "empty_value",
+                    "severity": "warning",
+                    "message": "PrevNumber is empty"
+                })
+
+            if not record.get("Inventory"):
+                record_warnings.append("Inventory is empty")
+                record_warnings_detail.append({
+                    "field": "Inventory",
+                    "issue_type": "empty_value",
+                    "severity": "warning",
+                    "message": "Inventory is empty"
+                })
+
+            # 3.3 检查 JarSize - 如果存在，应该是字符串
+            if record.get("JarSize") and not isinstance(record.get("JarSize"), str):
+                record_warnings.append(f"JarSize has invalid type: {type(record.get('JarSize'))}")
+                record_warnings_detail.append({
+                    "field": "JarSize",
+                    "issue_type": "invalid_type",
+                    "severity": "warning",
+                    "message": f"JarSize should be text, got: {record.get('JarSize')}"
+                })
+
+            # 检查是否有 error (severity: error) - 如果有error就设置为pending
+            has_errors = any(w.get("severity") == "error" for w in record_warnings_detail)
+
+            if has_errors:
+                record_status = "pending"
+                warnings.extend(record_warnings)
+                print(f"Record {primary_id}: Record details pending due to errors: {', '.join(record_warnings)}")
+            else:
+                # 即使有warnings,也设置为verified (按照需求3)
+                record_status = "verified"
+                if record_warnings:
+                    warnings.extend(record_warnings)
+                    print(f"Record {primary_id}: Record details verified with warnings: {', '.join(record_warnings)}")
+                else:
+                    print(f"Record {primary_id}: Record details verified (no warnings)")
+
+            # 4. 计算overall status
+            overall_status = "pending"
+            if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+                overall_status = "completed"
+
+            # 5. 构建更新语句
+            verification_notes = f"Auto-verified on import. Warnings: {'; '.join(warnings)}" if warnings else "Auto-verified on import"
+
+            # 合并已有的import warnings和新检测到的warnings
+            all_warnings = existing_warnings + record_warnings_detail
+            warnings_json_str = json.dumps(all_warnings) if all_warnings else None
+
+            update_sql = """
+            UPDATE primary_temp
+            SET
+                "species_verification_status" = $1,
+                "locality_verification_status" = $2,
+                "record_verification_status" = $3,
+                "overall_verification_status" = $4,
+                "verification_notes" = $5,
+                "verification_warnings" = $6,
+                "TimeStampModified" = NOW()
+            WHERE "PrimaryID" = $7
+            """
+
+            update_statements.append({
+                "sql": update_sql,
+                "params": [species_status, locality_status, record_status, overall_status, verification_notes, warnings_json_str, primary_id]
+            })
+
+        # 批量执行更新
+        if update_statements:
+            print(f"Executing {len(update_statements)} verification updates...")
+            await execute_transaction(update_statements)
+            print(f"Auto-verification completed for {len(records)} records")
+
+    except Exception as e:
+        print(f"Error during auto-verification: {str(e)}")
+        # 不抛出异常,允许导入继续
+
+
 async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Optional[int] = None):
     """
     处理直接导入（解析物种名称，关联taxonomic表）
@@ -719,7 +936,11 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "prev_number": None,
                 "inventory": None,
                 "remarks": "Imported via batch import - verbatim mode",
-                "match_type": match_result["match_status"]  # 使用实际的匹配状态
+                "match_type": match_result["match_status"],  # 使用实际的匹配状态
+                # 添加验证状态字段 (将在后面根据匹配结果设置)
+                "species_verification_status": "pending",
+                "locality_verification_status": "pending",
+                "record_verification_status": "pending"
             }
 
             # 映射其他标准字段到Primary记录
@@ -736,9 +957,19 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         record["collection_date"] = formatted_date if is_valid else None
                     elif field == "totalNumber":
                         try:
-                            record["total_number"] = int(float(value)) if not pd.isna(value) else 1
+                            if pd.isna(value):
+                                record["total_number"] = 1
+                                record["import_warnings"] = record.get("import_warnings", []) + [
+                                    f"TotalNumber was empty, defaulted to 1"
+                                ]
+                            else:
+                                record["total_number"] = int(float(value))
                         except (ValueError, TypeError):
+                            # 记录转换失败的原始值
                             record["total_number"] = 1  # 默认值
+                            record["import_warnings"] = record.get("import_warnings", []) + [
+                                f"TotalNumber had invalid value '{value}' (not a number), defaulted to 1"
+                            ]
                     elif field == "storage":
                         record["storage"] = str(value) if not pd.isna(value) else None
                     elif field == "jarSize":
@@ -778,6 +1009,10 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
         # 8. 插入 preparation_temp 记录
         print(f"插入 {len(primary_temp_ids)} 条 preparation_temp 记录...")
         prep_temp_ids = await db_utils.insert_preparation_temp_records(primary_temp_ids, total_numbers, "Fluid")
+
+        # 8.5. 自动验证导入的记录并更新验证状态
+        print(f"开始自动验证 {len(primary_temp_ids)} 条记录...")
+        await auto_verify_imported_records(primary_temp_ids, batch_serial_id)
 
         # 9. 更新导入状态
         await store_import_status(file_id, {
@@ -1260,4 +1495,377 @@ async def confirm_batch_import(request: ConfirmBatchImportModel):
             code=500,
             data={},
             message=f"Failed to confirm batch import: {str(e)}"
+        )
+
+
+@router.get("/batches/{batch_serial_id}/verificationSummary", response_model=ResponseModel)
+async def get_batch_verification_summary(batch_serial_id: str):
+    """
+    获取批次的验证摘要统计
+    返回各种验证状态的记录数，包括warnings和errors的统计
+    """
+    try:
+        query = """
+        WITH warning_analysis AS (
+            SELECT
+                "PrimaryID",
+                "verification_warnings",
+                CASE
+                    WHEN "verification_warnings" IS NOT NULL AND "verification_warnings" != '[]'
+                         AND "verification_warnings" LIKE '%"severity": "error"%' THEN TRUE
+                    ELSE FALSE
+                END as has_errors,
+                CASE
+                    WHEN "verification_warnings" IS NOT NULL AND "verification_warnings" != '[]'
+                         AND "verification_warnings" LIKE '%"severity": "warning"%' THEN TRUE
+                    ELSE FALSE
+                END as has_warnings
+            FROM primary_temp
+            WHERE batch_serial_id = $1
+        )
+        SELECT
+            COUNT(*) as total_records,
+            SUM(CASE WHEN p."overall_verification_status" = 'completed' THEN 1 ELSE 0 END) as fully_verified,
+            SUM(CASE WHEN wa.has_errors THEN 1 ELSE 0 END) as has_errors,
+            SUM(CASE WHEN wa.has_warnings THEN 1 ELSE 0 END) as has_warnings,
+            SUM(CASE WHEN COALESCE(p."species_verification_status", 'pending') = 'pending'
+                     OR COALESCE(p."locality_verification_status", 'pending') = 'pending'
+                     OR COALESCE(p."record_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as has_pending,
+            SUM(CASE WHEN p."species_verification_status" = 'verified' THEN 1 ELSE 0 END) as species_verified,
+            SUM(CASE WHEN p."locality_verification_status" = 'verified' THEN 1 ELSE 0 END) as locality_verified,
+            SUM(CASE WHEN p."record_verification_status" = 'verified' THEN 1 ELSE 0 END) as record_verified,
+            SUM(CASE WHEN COALESCE(p."species_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_taxonomic,
+            SUM(CASE WHEN COALESCE(p."locality_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_locality,
+            SUM(CASE WHEN COALESCE(p."record_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_record
+        FROM primary_temp p
+        JOIN warning_analysis wa ON p."PrimaryID" = wa."PrimaryID"
+        WHERE p.batch_serial_id = $1
+        """
+
+        result = await execute_query(query, batch_serial_id)
+
+        if not result:
+            return ResponseModel(
+                code=404,
+                message=f"Batch {batch_serial_id} not found"
+            )
+
+        stats = result[0]
+        total = stats["total_records"]
+
+        summary = {
+            "batch_serial_id": batch_serial_id,
+            "total_records": total,
+            "statistics": {
+                "fully_verified": {
+                    "count": stats["fully_verified"],
+                    "percentage": round((stats["fully_verified"] / total * 100), 1) if total > 0 else 0
+                },
+                "has_errors": {
+                    "count": stats["has_errors"],
+                    "percentage": round((stats["has_errors"] / total * 100), 1) if total > 0 else 0
+                },
+                "has_warnings": {
+                    "count": stats["has_warnings"],
+                    "percentage": round((stats["has_warnings"] / total * 100), 1) if total > 0 else 0
+                },
+                "has_pending": {
+                    "count": stats["has_pending"],
+                    "percentage": round((stats["has_pending"] / total * 100), 1) if total > 0 else 0
+                },
+                "species_verified": {
+                    "count": stats["species_verified"],
+                    "percentage": round((stats["species_verified"] / total * 100), 1) if total > 0 else 0
+                },
+                "locality_verified": {
+                    "count": stats["locality_verified"],
+                    "percentage": round((stats["locality_verified"] / total * 100), 1) if total > 0 else 0
+                },
+                "record_verified": {
+                    "count": stats["record_verified"],
+                    "percentage": round((stats["record_verified"] / total * 100), 1) if total > 0 else 0
+                },
+                "pending_taxonomic": {
+                    "count": stats["pending_taxonomic"],
+                    "percentage": round((stats["pending_taxonomic"] / total * 100), 1) if total > 0 else 0
+                },
+                "pending_locality": {
+                    "count": stats["pending_locality"],
+                    "percentage": round((stats["pending_locality"] / total * 100), 1) if total > 0 else 0
+                },
+                "pending_record": {
+                    "count": stats["pending_record"],
+                    "percentage": round((stats["pending_record"] / total * 100), 1) if total > 0 else 0
+                }
+            }
+        }
+
+        return ResponseModel(
+            code=20000,
+            data=summary
+        )
+
+    except Exception as e:
+        return ResponseModel(
+            code=500,
+            message=f"Failed to get verification summary: {str(e)}"
+        )
+
+
+@router.get("/batches/{batch_serial_id}/debugWarnings")
+async def debug_warnings(batch_serial_id: str):
+    """
+    调试API: 查看批次中所有记录的warnings信息
+    """
+    try:
+        query = """
+        SELECT
+            "PrimaryID",
+            "CatalogNumber",
+            "verification_warnings",
+            "species_verification_status",
+            "locality_verification_status",
+            "record_verification_status",
+            LENGTH("verification_warnings") as warnings_length
+        FROM primary_temp
+        WHERE batch_serial_id = $1
+        ORDER BY "CatalogNumber"
+        LIMIT 20
+        """
+
+        records = await execute_query(query, batch_serial_id)
+
+        # 格式化输出
+        debug_info = []
+        for r in records:
+            debug_info.append({
+                "catalog_number": r["CatalogNumber"],
+                "warnings_raw": r["verification_warnings"],
+                "warnings_length": r["warnings_length"],
+                "species_status": r["species_verification_status"],
+                "locality_status": r["locality_verification_status"],
+                "record_status": r["record_verification_status"]
+            })
+
+        return ResponseModel(
+            code=20000,
+            data={
+                "batch_serial_id": batch_serial_id,
+                "total_checked": len(records),
+                "records": debug_info
+            }
+        )
+
+    except Exception as e:
+        return ResponseModel(
+            code=500,
+            message=f"Debug failed: {str(e)}"
+        )
+
+
+@router.post("/batches/{batch_serial_id}/revalidate", response_model=ResponseModel)
+async def revalidate_batch_records(batch_serial_id: str):
+    """
+    重新验证批次中的所有记录
+    用于已导入的批次重新运行验证逻辑，更新warnings和verification status
+    """
+    try:
+        # 获取批次中的所有primary_temp记录ID
+        query = """
+        SELECT "PrimaryID"
+        FROM primary_temp
+        WHERE batch_serial_id = $1
+        """
+        records = await execute_query(query, batch_serial_id)
+
+        if not records:
+            return ResponseModel(
+                code=404,
+                message=f"No records found for batch {batch_serial_id}"
+            )
+
+        primary_temp_ids = [r["PrimaryID"] for r in records]
+
+        # 重新运行验证
+        await auto_verify_imported_records(primary_temp_ids, batch_serial_id)
+
+        return ResponseModel(
+            code=20000,
+            data={
+                "batch_serial_id": batch_serial_id,
+                "records_validated": len(primary_temp_ids)
+            },
+            message=f"Successfully re-validated {len(primary_temp_ids)} records"
+        )
+
+    except Exception as e:
+        return ResponseModel(
+            code=500,
+            message=f"Failed to revalidate batch: {str(e)}"
+        )
+
+
+@router.get("/batches/{batch_serial_id}/exportIssues")
+async def export_batch_issues(
+    batch_serial_id: str,
+    issue_type: Optional[str] = Query(None, description="Filter: 'warnings', 'errors', 'all'")
+):
+    """
+    导出批次中有issues的记录为Excel
+    支持筛选：warnings、errors或all
+    Excel中会使用颜色标记不同严重程度的问题
+    """
+    try:
+        # 构建查询条件
+        where_conditions = ["p.batch_serial_id = $1"]
+        params = [batch_serial_id]
+
+        if issue_type == "warnings":
+            where_conditions.append("""
+                (p."verification_warnings" IS NOT NULL AND p."verification_warnings" != '[]')
+                AND p."overall_verification_status" = 'completed'
+            """)
+        elif issue_type == "errors":
+            where_conditions.append("""
+                (p."species_verification_status" = 'pending' OR p."locality_verification_status" = 'pending')
+            """)
+        else:  # all
+            where_conditions.append("""
+                (
+                    (p."verification_warnings" IS NOT NULL AND p."verification_warnings" != '[]')
+                    OR p."species_verification_status" = 'pending'
+                    OR p."locality_verification_status" = 'pending'
+                )
+            """)
+
+        query = f"""
+        SELECT
+            p."PrimaryID",
+            p."CatalogNumber",
+            p."species_verification_status",
+            p."locality_verification_status",
+            p."record_verification_status",
+            p."overall_verification_status",
+            p."verification_notes",
+            p."verification_warnings",
+            p."TotalNumber",
+            p."Storage",
+            p."JarSize",
+            p."PrevNumber",
+            p."Inventory",
+            p."Remarks",
+            vt."verbatim_family",
+            vt."verbatim_genus",
+            vt."verbatim_species",
+            vt."match_status",
+            vl."verbatim_fieldno",
+            vl."verbatim_locality_string"
+        FROM primary_temp p
+        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
+        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+        WHERE {" AND ".join(where_conditions)}
+        ORDER BY p."CatalogNumber"
+        """
+
+        records = await execute_query(query, *params)
+
+        if not records:
+            return ResponseModel(
+                code=20000,
+                data={"message": "No issues found in this batch."}
+            )
+
+        # 准备Excel数据
+        excel_data = []
+        for record in records:
+            # 解析warnings JSON
+            warnings_list = []
+            if record.get("verification_warnings"):
+                try:
+                    warnings_data = json.loads(record["verification_warnings"])
+                    warnings_list = [w["message"] for w in warnings_data]
+                except:
+                    pass
+
+            row_data = {
+                "Catalog Number": record["CatalogNumber"],
+                "Family": record.get("verbatim_family", ""),
+                "Genus": record.get("verbatim_genus", ""),
+                "Species": record.get("verbatim_species", ""),
+                "Species Status": record["species_verification_status"],
+                "Match Type": record.get("match_status", ""),
+                "Field Number": record.get("verbatim_fieldno", ""),
+                "Locality": record.get("verbatim_locality_string", ""),
+                "Locality Status": record["locality_verification_status"],
+                "Total Number": record.get("TotalNumber", ""),
+                "Storage": record.get("Storage", ""),
+                "Jar Size": record.get("JarSize", ""),
+                "Prev Number": record.get("PrevNumber", ""),
+                "Inventory": record.get("Inventory", ""),
+                "Record Status": record["record_verification_status"],
+                "Overall Status": record["overall_verification_status"],
+                "Warnings": "; ".join(warnings_list) if warnings_list else "",
+                "Notes": record.get("verification_notes", "")
+            }
+            excel_data.append(row_data)
+
+        # 创建DataFrame
+        df = pd.DataFrame(excel_data)
+
+        # 生成Excel文件
+        output_filename = f"batch_{batch_serial_id}_issues_{issue_type or 'all'}.xlsx"
+        output_path = f"temp/{output_filename}"
+
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Issues', index=False)
+
+            # 获取workbook和worksheet对象
+            workbook = writer.book
+            worksheet = writer.sheets['Issues']
+
+            # 定义格式
+            warning_format = workbook.add_format({'bg_color': '#FFF3CD', 'font_color': '#856404'})
+            error_format = workbook.add_format({'bg_color': '#F8D7DA', 'font_color': '#721C24'})
+            success_format = workbook.add_format({'bg_color': '#D4EDDA', 'font_color': '#155724'})
+
+            # 应用条件格式
+            for row_num, row in enumerate(excel_data, start=1):
+                # Species Status列着色
+                species_col = df.columns.get_loc("Species Status")
+                if row["Species Status"] == "pending":
+                    worksheet.write(row_num, species_col, row["Species Status"], error_format)
+                elif row["Species Status"] == "verified":
+                    worksheet.write(row_num, species_col, row["Species Status"], success_format)
+
+                # Locality Status列着色
+                locality_col = df.columns.get_loc("Locality Status")
+                if row["Locality Status"] == "pending":
+                    worksheet.write(row_num, locality_col, row["Locality Status"], error_format)
+                elif row["Locality Status"] == "verified":
+                    worksheet.write(row_num, locality_col, row["Locality Status"], success_format)
+
+                # Overall Status列着色
+                overall_col = df.columns.get_loc("Overall Status")
+                if row["Overall Status"] == "pending":
+                    worksheet.write(row_num, overall_col, row["Overall Status"], error_format)
+                elif row["Overall Status"] == "completed":
+                    worksheet.write(row_num, overall_col, row["Overall Status"], success_format)
+
+                # Warnings列着色（如果有warnings）
+                warnings_col = df.columns.get_loc("Warnings")
+                if row["Warnings"]:
+                    worksheet.write(row_num, warnings_col, row["Warnings"], warning_format)
+
+        # 返回文件
+        file_like = open(output_path, mode="rb")
+        return StreamingResponse(
+            file_like,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={output_filename}"}
+        )
+
+    except Exception as e:
+        return ResponseModel(
+            code=500,
+            message=f"Failed to export issues: {str(e)}"
         )

@@ -264,14 +264,29 @@ class DatabaseUtils:
             current_seq += 1
             temp_catalog_number = f"{batch_serial_id}-{current_seq:03d}"
 
+            # 处理import warnings (如果有的话)
+            import_warnings = record.get("import_warnings", [])
+            warnings_json = None
+            if import_warnings:
+                # 转换为结构化的warning格式
+                warnings_list = []
+                for warning_msg in import_warnings:
+                    warnings_list.append({
+                        "field": "Import",
+                        "issue_type": "import_conversion",
+                        "severity": "error",
+                        "message": warning_msg
+                    })
+                warnings_json = json.dumps(warnings_list)
+
             insert_sql = """
             INSERT INTO primary_temp (
                 "CatalogNumber", "verbatim_taxonid", "verbatim_localityid",
                 "TotalNumber", "Storage", "JarSize", "PrevNumber",
                 "Inventory", "Remarks", "match_type", "review_flag",
-                "batch_serial_id", "TimeStampModified", "DateCataloged"
+                "batch_serial_id", "verification_warnings", "TimeStampModified", "DateCataloged"
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW()
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW()
             ) RETURNING "PrimaryID"
             """
 
@@ -287,7 +302,8 @@ class DatabaseUtils:
                 record.get("remarks"),
                 record.get("match_type", "no_match"),
                 record.get("review_flag", True),
-                batch_serial_id
+                batch_serial_id,
+                warnings_json
             ]
 
             statements.append({
