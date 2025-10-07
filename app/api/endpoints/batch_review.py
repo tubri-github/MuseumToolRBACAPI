@@ -108,21 +108,22 @@ async def get_verbatim_batches(
     可以按批次状态筛选：未处理、处理中、已完成
     """
     try:
-        # Base query
+        # Base query - 只查询 primary_temp 表
         base_query = """
-        SELECT DISTINCT batch_serial_id, 
+        SELECT DISTINCT batch_serial_id,
                MIN("TimeStampModified") as import_date,
                COUNT(*) as total_records,
                SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
                SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-               SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed
-        FROM "Primary"
+               SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+               MAX(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as is_migrated
+        FROM primary_temp
         WHERE batch_serial_id IS NOT NULL
         """
 
         count_query = """
         SELECT COUNT(DISTINCT batch_serial_id) as count
-        FROM "Primary"
+        FROM primary_temp
         WHERE batch_serial_id IS NOT NULL
         """
 
@@ -135,19 +136,21 @@ async def get_verbatim_batches(
             if filter_params.status == 'pending':
                 where_clauses.append("""
                 EXISTS (
-                    SELECT 1 FROM "Primary" p2 
-                    WHERE p2.batch_serial_id = "Primary".batch_serial_id 
+                    SELECT 1 FROM primary_temp p2
+                    WHERE p2.batch_serial_id = primary_temp.batch_serial_id
                     AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
                 )
                 """)
             elif filter_params.status == 'completed':
                 where_clauses.append("""
                 NOT EXISTS (
-                    SELECT 1 FROM "Primary" p2 
-                    WHERE p2.batch_serial_id = "Primary".batch_serial_id 
+                    SELECT 1 FROM primary_temp p2
+                    WHERE p2.batch_serial_id = primary_temp.batch_serial_id
                     AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
                 )
                 """)
+            elif filter_params.status == 'migrated':
+                where_clauses.append("final_primary_id IS NOT NULL")
 
         if filter_params.search:
             where_clauses.append(f"batch_serial_id ILIKE ${param_index}")
@@ -234,9 +237,9 @@ async def get_batch_info(batch_serial_id: str):
     获取指定批次的详细信息，包括导入时间、记录总数、处理进度等
     """
     try:
-        # Query batch details
+        # Query batch details from primary_temp
         batch_query = """
-        SELECT 
+        SELECT
             batch_serial_id,
             MIN("TimeStampModified") as import_date,
             COUNT(*) as total_records,
@@ -244,7 +247,7 @@ async def get_batch_info(batch_serial_id: str):
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
             SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records
-        FROM "Primary"
+        FROM primary_temp
         WHERE batch_serial_id = $1
         GROUP BY batch_serial_id
         """
@@ -393,7 +396,7 @@ async def get_batch_records(
             l."FieldNo" as matched_field_number,
             suggested_t."Genus" as suggested_genus,
             suggested_t."Species" as suggested_species
-        FROM "Primary" p
+        FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
         LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
@@ -404,7 +407,7 @@ async def get_batch_records(
 
         count_query = """
         SELECT COUNT(*) as count
-        FROM "Primary"
+        FROM primary_temp
         WHERE batch_serial_id = $1
         """
 
@@ -582,7 +585,7 @@ async def get_batch_records(
             SUM(CASE WHEN "record_verification_status" = 'verified' THEN 1 ELSE 0 END) as record_verified,
             SUM(CASE WHEN "overall_verification_status" = 'completed' THEN 1 ELSE 0 END) as fully_verified,
             SUM(CASE WHEN vt."matched_taxon_id" IS NOT NULL THEN 1 ELSE 0 END) as has_taxonomic_suggestions
-        FROM "Primary" p
+        FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         WHERE p.batch_serial_id = $1
         """
@@ -1300,10 +1303,10 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
     try:
         # Verify the record exists - 只添加验证状态字段到查询
         check_query = """
-        SELECT "PrimaryID", "CatalogNumber", "TaxonID", "Locality1ID", "review_flag", 
-               "verbatim_localityid", "species_verification_status", 
+        SELECT "PrimaryID", "CatalogNumber", "TaxonID", "Locality1ID", "review_flag",
+               "verbatim_localityid", "species_verification_status",
                "locality_verification_status", "record_verification_status"
-        FROM "Primary"
+        FROM primary_temp
         WHERE "PrimaryID" = $1
         """
 
@@ -1338,7 +1341,6 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
                 update_data.locality_verification_status = 'pending'
 
         # Map of field names to database column names for Primary table
-        # 只在现有映射中添加验证状态字段
         field_mapping = {
             "taxon_id": "TaxonID",
             "locality_id": "Locality1ID",
@@ -1350,21 +1352,36 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
             "inventory": "Inventory",
             "remarks": "Remarks",
             "review_flag": "review_flag",
-            # 新增验证状态字段映射 - 这是唯一的修改
             "species_verification_status": "species_verification_status",
             "locality_verification_status": "locality_verification_status",
             "record_verification_status": "record_verification_status",
             "verification_notes": "verification_notes"
         }
 
-        # Add fields to update for Primary table (保持现有逻辑不变)
+        # Add fields to update for Primary table
         for field, db_column in field_mapping.items():
             if hasattr(update_data, field) and getattr(update_data, field) is not None:
                 update_fields.append(f"\"{db_column}\" = ${param_index}")
                 update_values.append(getattr(update_data, field))
                 param_index += 1
 
-        # Always update timestamp (保持现有逻辑不变)
+        # 自动计算 overall_verification_status（派生字段）
+        # 获取将要更新后的状态值
+        species_status = update_data.species_verification_status if hasattr(update_data, "species_verification_status") and update_data.species_verification_status else existing_record.get("species_verification_status", "pending")
+        locality_status = update_data.locality_verification_status if hasattr(update_data, "locality_verification_status") and update_data.locality_verification_status else existing_record.get("locality_verification_status", "pending")
+        record_status = update_data.record_verification_status if hasattr(update_data, "record_verification_status") and update_data.record_verification_status else existing_record.get("record_verification_status", "pending")
+
+        # 计算overall状态：只有当三个都是verified时才是completed
+        if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+            overall_status = "completed"
+        else:
+            overall_status = "pending"
+
+        update_fields.append(f"\"overall_verification_status\" = ${param_index}")
+        update_values.append(overall_status)
+        param_index += 1
+
+        # Always update timestamp
         update_fields.append(f"\"TimeStampModified\" = ${param_index}")
         update_values.append(datetime.now())
         param_index += 1
@@ -1372,10 +1389,10 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
         # If nothing to update in Primary table, check for field_number updates (保持现有逻辑不变)
         has_primary_updates = len(update_fields) > 1  # More than just timestamp
 
-        # Build and execute update query for Primary table if needed (保持现有逻辑不变)
+        # Build and execute update query for primary_temp table if needed (保持现有逻辑不变)
         if has_primary_updates:
             update_query = f"""
-            UPDATE "Primary"
+            UPDATE primary_temp
             SET {", ".join(update_fields)}
             WHERE "PrimaryID" = ${param_index}
             RETURNING "PrimaryID", "CatalogNumber", "TimeStampModified"
@@ -1404,7 +1421,7 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
 
         if prep_update_needed:
             prep_update_query = """
-            UPDATE "Preparation"
+            UPDATE preparation_temp
             SET "Count" = $1, "TimeStampModified" =$2
             WHERE "PrimaryID" = $3
             RETURNING "PreparationID"
@@ -1441,17 +1458,17 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
         # Update matched locality if needed (保持现有逻辑不变)
         if hasattr(update_data, "field_number") and existing_record["Locality1ID"]:
             locality_update = """
-            UPDATE locality
-            SET "FieldNumber" = $1, "TimeStampModified" = $2
-            WHERE "LocalityID" = $3
-            RETURNING "LocalityID"
+            UPDATE locality1
+            SET "FieldNo" = $1, "TimeStampModified" = $2
+            WHERE "Locality1ID" = $3
+            RETURNING "Locality1ID"
             """
 
             locality_result = await execute_query(
                 locality_update,
                 update_data.field_number,
                 datetime.now(),
-                existing_record["LocalityID"]
+                existing_record["Locality1ID"]
             )
 
             field_number_updated = True if locality_result else field_number_updated
@@ -1468,7 +1485,7 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
         # If both are processed and review flag hasn't been explicitly set, mark as reviewed (保持现有逻辑不变)
         if taxonomic_processed and locality_processed and not hasattr(update_data, "review_flag"):
             review_update_query = """
-            UPDATE "Primary"
+            UPDATE primary_temp
             SET "review_flag" = false, "TimeStampModified" = $1
             WHERE "PrimaryID" = $2
             """
@@ -1477,8 +1494,8 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
 
         # Get the batch_serial_id for this record (保持现有逻辑不变)
         batch_query = """
-        SELECT batch_serial_id 
-        FROM "Primary"
+        SELECT batch_serial_id
+        FROM primary_temp
         WHERE "PrimaryID" = $1
         """
 
@@ -1600,13 +1617,13 @@ async def bulk_update_records(
         update_values.append(datetime.now())
         param_index += 1
 
-        # Update Primary records if there are fields to update
+        # Update primary_temp records if there are fields to update
         primary_updated_ids = []
         if update_fields:
-            # Build and execute update query for Primary table
+            # Build and execute update query for primary_temp table
             record_placeholders = ", ".join([f"${i}" for i in range(param_index, param_index + len(record_ids))])
             update_query = f"""
-            UPDATE "Primary"
+            UPDATE primary_temp
             SET {", ".join(update_fields)}
             WHERE "PrimaryID" IN ({record_placeholders})
             AND batch_serial_id = ${param_index + len(record_ids)}
@@ -1619,12 +1636,12 @@ async def bulk_update_records(
             update_result = await execute_query(update_query, *update_values)
             primary_updated_ids = [r["PrimaryID"] for r in update_result]
 
-            # If total_number was updated, also update preparation records
+            # If total_number was updated, also update preparation_temp records
             if "total_number" in field_updates:
-                # For each primary ID, update its preparation records
+                # For each primary ID, update its preparation_temp records
                 for primary_id in primary_updated_ids:
                     prep_update_query = """
-                    UPDATE "Preparation"
+                    UPDATE preparation_temp
                     SET "Count" = $1, "TimeStampModified" = $2
                     WHERE "PrimaryID" = $3
                     """
@@ -1641,8 +1658,8 @@ async def bulk_update_records(
         if field_number is not None:
             # First, get verbatim_locality_ids and locality_ids for all records
             ids_query = """
-            SELECT "PrimaryID", "verbatim_localityid", "LocalityID"
-            FROM "Primary"
+            SELECT "PrimaryID", "verbatim_localityid", "Locality1ID"
+            FROM primary_temp
             WHERE "PrimaryID" IN ({}) AND batch_serial_id = $1
             """.format(",".join([str(id) for id in record_ids]))
 
@@ -1672,14 +1689,14 @@ async def bulk_update_records(
                         field_number_updated_ids.append(r["PrimaryID"])
 
             # Update locality records
-            locality_ids = [r["LocalityID"] for r in ids_result if r["LocalityID"] is not None]
+            locality_ids = [r["Locality1ID"] for r in ids_result if r["Locality1ID"] is not None]
             if locality_ids:
                 locality_placeholders = ", ".join([f"${i + 1}" for i in range(len(locality_ids))])
                 locality_update = f"""
-                UPDATE locality
-                SET "FieldNumber" = $1, "TimeStampModified" = $2
-                WHERE "LocalityID" IN ({locality_placeholders})
-                RETURNING "LocalityID"
+                UPDATE locality1
+                SET "FieldNo" = $1, "TimeStampModified" = $2
+                WHERE "Locality1ID" IN ({locality_placeholders})
+                RETURNING "Locality1ID"
                 """
 
                 locality_result = await execute_query(
@@ -1691,7 +1708,7 @@ async def bulk_update_records(
 
                 # Track records that had field_number updated
                 for r in ids_result:
-                    if r["LocalityID"] in [lr["LocalityID"] for lr in locality_result]:
+                    if r["Locality1ID"] in [lr["Locality1ID"] for lr in locality_result]:
                         if r["PrimaryID"] not in field_number_updated_ids:
                             field_number_updated_ids.append(r["PrimaryID"])
 
@@ -1744,11 +1761,12 @@ async def mark_batch_completed(batch_serial_id: str):
     将批次标记为已完成
     """
     try:
-        # Check if the batch exists
+        # Check if the batch exists and all records are fully verified
         check_query = """
-        SELECT COUNT(*) as count, 
-               SUM(CASE WHEN "TaxonID" IS NULL OR "LocalityID" IS NULL THEN 1 ELSE 0 END) as incomplete
-        FROM "Primary"
+        SELECT COUNT(*) as count,
+               -- SUM(CASE WHEN "TaxonID" IS NULL OR "Locality1ID" IS NULL THEN 1 ELSE 0 END) as incomplete,
+               SUM(CASE WHEN "overall_verification_status" != 'completed' THEN 1 ELSE 0 END) as not_verified
+        FROM primary_temp
         WHERE batch_serial_id = $1
         """
 
@@ -1760,17 +1778,26 @@ async def mark_batch_completed(batch_serial_id: str):
                 message=f"Batch with serial ID {batch_serial_id} not found"
             )
 
-        # Check if all records are processed
-        incomplete_count = check_result[0]["incomplete"]
-        if incomplete_count > 0:
+        # 注释掉 TaxonID/Locality1ID 检查 - 如果后续需要可以打开
+        # Check if all records are processed (have TaxonID and Locality1ID)
+        # incomplete_count = check_result[0]["incomplete"]
+        # if incomplete_count > 0:
+        #     return ResponseModel(
+        #         code=40000,
+        #         message=f"Cannot mark batch as completed. {incomplete_count} records are still missing TaxonID or Locality1ID."
+        #     )
+
+        # Check if all records are verified (overall_verification_status = 'completed')
+        not_verified_count = check_result[0]["not_verified"]
+        if not_verified_count > 0:
             return ResponseModel(
                 code=40000,
-                message=f"Cannot mark batch as completed. {incomplete_count} records are still incomplete."
+                message=f"Cannot mark batch as completed. {not_verified_count} records have not been fully verified (overall_verification_status != 'completed')."
             )
 
         # Mark all records in the batch as not needing review
         update_query = """
-        UPDATE "Primary"
+        UPDATE primary_temp
         SET "review_flag" = false, "TimeStampModified" = $1
         WHERE batch_serial_id = $2
         RETURNING "PrimaryID"
@@ -1822,14 +1849,14 @@ async def get_batch_progress(batch_serial_id: str):
     try:
         # Query batch progress
         progress_query = """
-        SELECT 
+        SELECT
             batch_serial_id,
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
-            SUM(CASE WHEN "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records
-        FROM "Primary"
+        FROM primary_temp
         WHERE batch_serial_id = $1
         GROUP BY batch_serial_id
         """
@@ -1847,11 +1874,11 @@ async def get_batch_progress(batch_serial_id: str):
 
         # Calculate time statistics
         time_query = """
-        SELECT 
+        SELECT
             MIN("TimeStampModified") as start_time,
             MAX("TimeStampModified") as last_update,
             MAX("TimeStampModified") - MIN("TimeStampModified") as duration
-        FROM "Primary"
+        FROM primary_temp
         WHERE batch_serial_id = $1
         """
 
@@ -1912,13 +1939,13 @@ async def export_batch_results(batch_serial_id: str):
     try:
         # Query all records in the batch with related data - updated to include field_number from locality tables
         query = """
-        SELECT 
+        SELECT
             p."PrimaryID",
             p."CatalogNumber",
             p."verbatim_taxonid",
             p."verbatim_localityid",
             p."TaxonID",
-            p."LocalityID",
+            p."Locality1ID",
             p."TotalNumber",
             p."Storage",
             p."JarSize",
@@ -1938,12 +1965,12 @@ async def export_batch_results(batch_serial_id: str):
             vl."verbatim_waterbody",
             vl."verbatim_lat",
             vl."verbatim_lon",
-            vl."field_number" as verbatim_field_number,
-            vt."verbatim_collec_date" as verbatim_collection_date,
+            vl."verbatim_fieldno" as verbatim_field_number,
+            vl."verbatim_collect_date" as verbatim_collection_date,
             t."Genus" as matched_genus,
             t."Species" as matched_species,
             t."Author" as matched_author,
-            l."Locality" as matched_locality,
+            l."LocalityString" as matched_locality,
             l."Country" as matched_country,
             l."State" as matched_state,
             l."County" as matched_county,
@@ -1951,16 +1978,16 @@ async def export_batch_results(batch_serial_id: str):
             l."Waterbody" as matched_waterbody,
             l."Latitude" as matched_lat,
             l."Longitude" as matched_lon,
-            l."FieldNumber" as matched_field_number,
+            l."FieldNo" as matched_field_number,
             prep."PreparationID",
             prep."PreparationType",
             prep."Count"
-        FROM "Primary" p
+        FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
-        LEFT JOIN taxonomic t ON p."TaxonID" = t."TaxonID"
-        LEFT JOIN locality l ON p."LocalityID" = l."LocalityID"
-        LEFT JOIN "Preparation" prep ON p."PrimaryID" = prep."PrimaryID"
+        LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
+        LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
+        LEFT JOIN preparation_temp prep ON p."PrimaryID" = prep."PrimaryID"
         WHERE p.batch_serial_id = $1
         ORDER BY p."CatalogNumber"
         """
@@ -2067,16 +2094,16 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
     try:
         # Query recent batch statistics
         batch_query = """
-        SELECT 
+        SELECT
             COUNT(DISTINCT batch_serial_id) as total_batches,
             SUM(CASE WHEN NOT EXISTS (
-                SELECT 1 FROM "Primary" p2 
-                WHERE p2.batch_serial_id = p1.batch_serial_id 
-                AND (p2."TaxonID" IS NULL OR p2."LocalityID" IS NULL)
+                SELECT 1 FROM primary_temp p2
+                WHERE p2.batch_serial_id = p1.batch_serial_id
+                AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
             ) THEN 1 ELSE 0 END) as completed_batches
         FROM (
             SELECT DISTINCT batch_serial_id
-            FROM "Primary"
+            FROM primary_temp
             WHERE "TimeStampModified" >= NOW() - INTERVAL '%s days'
         ) p1
         """
@@ -2085,13 +2112,13 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
 
         # Query recent record statistics
         record_query = """
-        SELECT 
+        SELECT
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
-            SUM(CASE WHEN "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             COUNT(DISTINCT batch_serial_id) as batches_count
-        FROM "Primary"
+        FROM primary_temp
         WHERE "TimeStampModified" >= NOW() - INTERVAL '%s days'
         """
 
@@ -2099,15 +2126,15 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
 
         # Query top active batches
         active_batch_query = """
-        SELECT 
+        SELECT
             batch_serial_id,
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
-            SUM(CASE WHEN "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "LocalityID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             MIN("TimeStampModified") as import_date,
             MAX("TimeStampModified") as last_modified
-        FROM "Primary"
+        FROM primary_temp
         WHERE "TimeStampModified" >= NOW() - INTERVAL '%s days'
         GROUP BY batch_serial_id
         ORDER BY last_modified DESC
@@ -2205,7 +2232,7 @@ async def batch_update_verification_status(update_data: BatchVerificationUpdateM
         record_placeholders = ", ".join([f"${i + param_index - 1}" for i in range(len(update_data.record_ids))])
 
         update_query = f"""
-        UPDATE "Primary"
+        UPDATE primary_temp
         SET {", ".join(update_fields)}
         WHERE "PrimaryID" IN ({record_placeholders})
         RETURNING "PrimaryID"
@@ -2243,7 +2270,7 @@ async def apply_taxonomic_suggestion(record_id: int):
         # 获取记录和建议信息
         suggestion_query = """
         SELECT p."PrimaryID", p."verbatim_taxonid", vt."matched_taxon_id"
-        FROM "Primary" p
+        FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         WHERE p."PrimaryID" = $1 AND vt."matched_taxon_id" IS NOT NULL
         """
@@ -2260,8 +2287,8 @@ async def apply_taxonomic_suggestion(record_id: int):
 
         # 应用建议并更新验证状态
         apply_query = """
-        UPDATE "Primary"
-        SET "TaxonID" = $1, 
+        UPDATE primary_temp
+        SET "TaxonID" = $1,
             "species_verification_status" = 'verified',
             "TimeStampModified" = $2
         WHERE "PrimaryID" = $3
@@ -2276,7 +2303,7 @@ async def apply_taxonomic_suggestion(record_id: int):
             UPDATE verbatim_taxonomic
             SET "suggestion_applied" = true
             WHERE "verbatim_taxonid" = (
-                SELECT "verbatim_taxonid" FROM "Primary" WHERE "PrimaryID" = $1
+                SELECT "verbatim_taxonid" FROM primary_temp WHERE "PrimaryID" = $1
             )
             """
 

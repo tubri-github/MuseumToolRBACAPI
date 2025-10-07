@@ -771,13 +771,13 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             record["verbatim_taxonomic_id"] = verbatim_taxonomic_ids[i] if i < len(verbatim_taxonomic_ids) else None
             record["verbatim_locality_id"] = verbatim_locality_ids[i] if i < len(verbatim_locality_ids) else None
 
-        # 7. 插入Primary记录
-        print(f"插入 {len(valid_records)} 条 Primary 记录...")
-        primary_ids = await db_utils.insert_primary_records(valid_records, batch_serial_id)
+        # 7. 插入 primary_temp 记录（verbatim 模式使用临时表）
+        print(f"插入 {len(valid_records)} 条 primary_temp 记录...")
+        primary_temp_ids = await db_utils.insert_primary_temp_records(valid_records, batch_serial_id)
 
-        # 8. 插入Preparation记录
-        print(f"插入 {len(primary_ids)} 条 Preparation 记录...")
-        prep_ids = await db_utils.insert_preparation_records(primary_ids, total_numbers, "Fluid")
+        # 8. 插入 preparation_temp 记录
+        print(f"插入 {len(primary_temp_ids)} 条 preparation_temp 记录...")
+        prep_temp_ids = await db_utils.insert_preparation_temp_records(primary_temp_ids, total_numbers, "Fluid")
 
         # 9. 更新导入状态
         await store_import_status(file_id, {
@@ -785,22 +785,22 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             "status": "completed",
             "fileName": file_info["fileName"],
             "totalRecords": len(df),
-            "importedCount": len(primary_ids),
+            "importedCount": len(primary_temp_ids),
             "skippedCount": 0,  # verbatim模式下不跳过记录
             "success": True,
             "userId": user_id,
             "batchSerialId": batch_serial_id,
-            "preparationIds": prep_ids,
+            "preparationTempIds": prep_temp_ids,
             "verbatimTaxonomicIds": verbatim_taxonomic_ids,
             "verbatimLocalityIds": verbatim_locality_ids,
-            "note": "Records imported in verbatim mode - all original data and matching results preserved in verbatim tables for manual review"
+            "note": "Records imported in verbatim mode (temp tables) - all original data and matching results preserved for manual review and final import"
         })
 
         # 10. 清理临时文件
         if os.path.exists(file_path):
             os.remove(file_path)
 
-        print(f"Verbatim导入完成: {len(primary_ids)} 条记录")
+        print(f"Verbatim导入完成: {len(primary_temp_ids)} 条记录 (存入临时表)")
 
     except Exception as e:
         print(f"Verbatim导入失败: {str(e)}")
@@ -1230,4 +1230,34 @@ async def validate_database_consistency():
             code=500,
             data={},
             message=f"Failed to validate database consistency: {str(e)}"
+        )
+
+
+class ConfirmBatchImportModel(BaseModel):
+    batchSerialId: str
+
+
+@router.post("/confirmBatchImport", response_model=ResponseModel)
+async def confirm_batch_import(request: ConfirmBatchImportModel):
+    """
+    确认批次导入，将 primary_temp 数据迁移到 Primary 表
+    生成正式的 catalog number
+    """
+    try:
+        batch_serial_id = request.batchSerialId
+
+        # 调用迁移函数
+        result = await db_utils.migrate_batch_from_temp_to_primary(batch_serial_id)
+
+        return ResponseModel(
+            code=20000,
+            data=result,
+            message=f"Successfully migrated batch {batch_serial_id}. Generated catalog numbers: {result['catalog_number_range']['start']}-{result['catalog_number_range']['end']}"
+        )
+
+    except Exception as e:
+        return ResponseModel(
+            code=500,
+            data={},
+            message=f"Failed to confirm batch import: {str(e)}"
         )
