@@ -705,7 +705,7 @@ async def get_locality_by_id(locality_id: int):
     """
     try:
         query = """
-        SELECT 
+        SELECT
             l."Locality1ID",
             l."FieldNo",
             l."LocalityString",
@@ -715,7 +715,7 @@ async def get_locality_by_id(locality_id: int):
             l."County",
             l."Continent",
             l."Island",
-            l."IslandGroup" as "Island Group",
+            l."Island Group" as "IslandGroup",
             l."ElevationMethod",
             l."ElevationMethodID",
             l."WaterBody",
