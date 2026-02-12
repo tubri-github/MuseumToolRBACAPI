@@ -1997,7 +1997,7 @@ async def export_batch_results(batch_serial_id: str):
         FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
-        LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
+        LEFT JOIN "TaxonomicTable" t ON t."TaxonID" = COALESCE(p."TaxonID", CASE WHEN vt."match_status" = 'exact' THEN vt."matched_taxon_id" END)
         LEFT JOIN "Family" fam ON t."FamilyID" = fam."FamilyID"
         LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
         LEFT JOIN preparation_temp prep ON p."PrimaryID" = prep."PrimaryID"
