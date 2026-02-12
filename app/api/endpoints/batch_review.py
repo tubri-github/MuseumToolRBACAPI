@@ -1978,17 +1978,18 @@ async def export_batch_results(batch_serial_id: str):
             vl."verbatim_lon",
             vl."verbatim_fieldno" as verbatim_field_number,
             vl."verbatim_collect_date" as verbatim_collection_date,
+            vl."verbatim_collector",
+            fam."FamilyName" as matched_family,
             t."Genus" as matched_genus,
             t."Species" as matched_species,
-            t."Author" as matched_author,
             l."LocalityString" as matched_locality,
             l."Country" as matched_country,
             l."State" as matched_state,
             l."County" as matched_county,
             l."Drainage" as matched_drainage,
-            l."Waterbody" as matched_waterbody,
-            l."Latitude" as matched_lat,
-            l."Longitude" as matched_lon,
+            l."WaterBody" as matched_waterbody,
+            l."Lat" as matched_lat,
+            l."Lon" as matched_lon,
             l."FieldNo" as matched_field_number,
             prep."PreparationID",
             prep."PreparationType",
@@ -1997,6 +1998,7 @@ async def export_batch_results(batch_serial_id: str):
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
         LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
         LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
+        LEFT JOIN "Family" fam ON t."FamilyID" = fam."FamilyID"
         LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
         LEFT JOIN preparation_temp prep ON p."PrimaryID" = prep."PrimaryID"
         WHERE p.batch_serial_id = $1
@@ -2012,7 +2014,7 @@ async def export_batch_results(batch_serial_id: str):
         df = pd.DataFrame(result)
 
         # Format dates
-        date_columns = ["CollectionDate", "TimeStampModified"]
+        date_columns = ["verbatim_collection_date", "TimeStampModified"]
         for col in date_columns:
             if col in df.columns:
                 df[col] = df[col].apply(lambda x: x.isoformat() if x else None)
@@ -2023,7 +2025,6 @@ async def export_batch_results(batch_serial_id: str):
             "matched_family": "Family",
             "matched_genus": "Genus",
             "matched_species": "Species",
-            "matched_author": "Author",
             "matched_locality": "Locality",
             "matched_country": "Country",
             "matched_state": "State",
@@ -2032,8 +2033,7 @@ async def export_batch_results(batch_serial_id: str):
             "matched_waterbody": "Waterbody",
             "matched_lat": "Latitude",
             "matched_lon": "Longitude",
-            "matched_field_number": "Field Number",  # Updated field name
-            "CollectionDate": "Collection Date",
+            "matched_field_number": "Field Number",
             "TotalNumber": "Total Number",
             "Storage": "Storage",
             "JarSize": "Jar Size",
@@ -2042,14 +2042,20 @@ async def export_batch_results(batch_serial_id: str):
             "Remarks": "Remarks",
             "PreparationType": "Preparation Type",
             "Count": "Specimen Count",
-            "verbatim_family": "Original Family",
-            "verbatim_genus": "Original Genus",
-            "verbatim_species": "Original Species",
-            "verbatim_locality_string": "Original Locality",
-            "verbatim_country": "Original Country",
-            "verbatim_state": "Original State",
-            "verbatim_county": "Original County",
-            "verbatim_field_number": "Original Field Number"  # Added original field number
+            "verbatim_family": "Verbatim Family",
+            "verbatim_genus": "Verbatim Genus",
+            "verbatim_species": "Verbatim Species",
+            "verbatim_locality_string": "Verbatim Locality",
+            "verbatim_country": "Verbatim Country",
+            "verbatim_state": "Verbatim State",
+            "verbatim_county": "Verbatim County",
+            "verbatim_drainage": "Verbatim Drainage",
+            "verbatim_waterbody": "Verbatim Waterbody",
+            "verbatim_lat": "Verbatim Latitude",
+            "verbatim_lon": "Verbatim Longitude",
+            "verbatim_field_number": "Verbatim Field Number",
+            "verbatim_collection_date": "Verbatim Collection Date",
+            "verbatim_collector": "Verbatim Collector"
         }
 
         # Keep only the columns we want to export
@@ -2068,8 +2074,8 @@ async def export_batch_results(batch_serial_id: str):
             summary_data = {
                 "Total Records": len(df),
                 "Taxonomic Processed": sum(df["TaxonID"].notna()),
-                "Locality Processed": sum(df["LocalityID"].notna()),
-                "Fully Processed": sum((df["TaxonID"].notna()) & (df["LocalityID"].notna())),
+                "Locality Processed": sum(df["Locality1ID"].notna()),
+                "Fully Processed": sum((df["TaxonID"].notna()) & (df["Locality1ID"].notna())),
                 "Batch ID": batch_serial_id,
                 "Export Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
