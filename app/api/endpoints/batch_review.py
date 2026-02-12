@@ -2083,12 +2083,17 @@ async def export_batch_results(batch_serial_id: str):
             summary_df = pd.DataFrame(list(summary_data.items()), columns=['Metric', 'Value'])
             summary_df.to_excel(writer, sheet_name='Summary', index=False)
 
-            # Adjust column widths
-            for sheet_name in writer.sheets:
-                worksheet = writer.sheets[sheet_name]
-                for i, col in enumerate(df.columns):
-                    max_len = max(df[col].astype(str).apply(len).max(), len(col) + 2)
-                    worksheet.set_column(i, i, max_len)
+            # Adjust column widths for Records sheet
+            records_ws = writer.sheets['Records']
+            for i, col in enumerate(export_df.columns):
+                max_len = max(export_df[col].astype(str).apply(len).max(), len(col) + 2)
+                records_ws.set_column(i, i, min(max_len, 50))
+
+            # Adjust column widths for Summary sheet
+            summary_ws = writer.sheets['Summary']
+            for i, col in enumerate(summary_df.columns):
+                max_len = max(summary_df[col].astype(str).apply(len).max(), len(col) + 2)
+                summary_ws.set_column(i, i, min(max_len, 50))
 
         # Return the file as a response
         return FileResponse(
