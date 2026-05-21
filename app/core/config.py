@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     AUTH_CENTER_API_KEY: str = Field(default="")
     PROJECT_CODE: str = Field(default="FMMT")
 
+    # TaxonRank Database settings (same server, different database)
+    TAXON_DB_HOST: str = Field(default="")
+    TAXON_DB_PORT: int = Field(default=5432)
+    TAXON_DB_USER: str = Field(default="")
+    TAXON_DB_PASSWORD: str = Field(default="")
+    TAXON_DB_NAME: str = Field(default="")
+
     # Service settings
     SYNC_BATCH_SIZE: int = Field(default=100)  # Number of records to sync at once
 

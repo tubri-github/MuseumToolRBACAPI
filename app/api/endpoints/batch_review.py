@@ -11,9 +11,14 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation, execute_transaction
+from app.services.es_sync import handle_data_change
 from app.utils.validation import ImportValidationUtils
 from app.utils.species_validation import SpeciesNameValidator
 router = APIRouter()
+
+
+class ApplyFamilyTaxonModel(BaseModel):
+    family_id: int
 
 # Pydantic models
 class ResponseModel(BaseModel):
@@ -36,10 +41,61 @@ class FilterParams:
     def __init__(
             self,
             status: Optional[str] = Query(None, description="Filter by processing status"),
-            search: Optional[str] = Query(None, description="Search term")
+            search: Optional[str] = Query(None, description="Global search term"),
+            field_filters: Optional[str] = Query(
+                None,
+                description='JSON string mapping whitelisted field names to a list of search values, '
+                            'e.g. {"verbatim_genus":["Acanthurus"],"verbatim_family":["Acanthuridae","Cyprinidae"]}'
+            )
     ):
         self.status = status
         self.search = search
+        self.field_filters = field_filters
+
+
+# 白名单：API 字段名 → SQL 列表达式（防注入 + 限定可搜列）
+SEARCHABLE_FIELDS = {
+    "catalog_number": 'p."CatalogNumber"::text',
+    "storage": 'p."Storage"',
+    "jar_size": 'p."JarSize"',
+    "prev_number": 'p."PrevNumber"',
+    "remarks": 'p."Remarks"',
+    "verbatim_family": 'vt."verbatim_family"',
+    "verbatim_genus": 'vt."verbatim_genus"',
+    "verbatim_species": 'vt."verbatim_species"',
+    "verbatim_field_number": 'vl."verbatim_fieldno"',
+    "verbatim_locality_string": 'vl."verbatim_locality_string"',
+    "verbatim_country": 'vl."verbatim_country"',
+    "verbatim_state": 'vl."verbatim_state"',
+    "verbatim_county": 'vl."verbatim_county"',
+    "verbatim_drainage": 'vl."verbatim_drainage"',
+    "verbatim_waterbody": 'vl."verbatim_waterbody"',
+    "verbatim_collector": 'vl."verbatim_collector"',
+    "matched_genus": 't."Genus"',
+    "matched_species": 't."Species"',
+    "matched_family": 'matched_fam."FamilyName"',
+    "matched_locality": 'l."LocalityString"',
+    "matched_field_number": 'l."FieldNo"',
+    "suggested_genus": 'suggested_t."Genus"',
+    "suggested_species": 'suggested_t."Species"',
+    "suggested_family": 'suggested_fam."FamilyName"',
+    # 拼接虚拟字段：用户搜 "A. affinis" 这类完整学名时可以一次匹配
+    "verbatim_full_name": "(COALESCE(vt.\"verbatim_genus\",'') || ' ' || COALESCE(vt.\"verbatim_species\",''))",
+    "matched_full_name": 't."FullScientificName"',
+    "suggested_full_name": 'suggested_t."FullScientificName"',
+}
+
+# 共享 JOIN：base_query 和 count_query 必须用同一份，避免出现一边引用了未 JOIN 的表的 bug
+JOINS_FOR_FILTERING = """
+LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
+LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
+LEFT JOIN "Family" matched_fam ON t."FamilyID" = matched_fam."FamilyID"
+LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
+LEFT JOIN "TaxonomicTable" suggested_t ON vt."matched_taxon_id" = suggested_t."TaxonID"
+LEFT JOIN "Family" suggested_fam ON suggested_t."FamilyID" = suggested_fam."FamilyID"
+LEFT JOIN "Family" verbatim_fam ON LOWER(TRIM(vt."verbatim_family")) = LOWER(TRIM(verbatim_fam."FamilyName"))
+"""
 
 
 class VerbatimTaxonomicModel(BaseModel):
@@ -393,24 +449,23 @@ async def get_batch_records(
             vl."verbatim_collector",
             t."Genus" as matched_genus,
             t."Species" as matched_species,
+            matched_fam."FamilyName" as matched_family,
             l."LocalityString" as matched_locality,
             l."FieldNo" as matched_field_number,
             suggested_t."Genus" as suggested_genus,
-            suggested_t."Species" as suggested_species
+            suggested_t."Species" as suggested_species,
+            suggested_fam."FamilyName" as suggested_family,
+            verbatim_fam."FamilyID" as verbatim_family_id,
+            verbatim_fam."FamilyName" as verbatim_family_matched
         FROM primary_temp p
-        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
-        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
-        LEFT JOIN "TaxonomicTable" t ON p."TaxonID" = t."TaxonID"
-        LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
-        LEFT JOIN "TaxonomicTable" suggested_t ON vt."matched_taxon_id" = suggested_t."TaxonID"
+        """ + JOINS_FOR_FILTERING + """
         WHERE p.batch_serial_id = $1
         """
 
         count_query = """
         SELECT COUNT(*) as count
         FROM primary_temp p
-        LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
-        LEFT JOIN verbatim_locality vl ON p."verbatim_localityid" = vl."verbatim_localityid"
+        """ + JOINS_FOR_FILTERING + """
         WHERE p.batch_serial_id = $1
         """
 
@@ -450,6 +505,40 @@ async def get_batch_records(
             )""")
             params.append(f"%{filter_params.search}%")
             param_index += 1
+
+        # Field-specific filters: JSON {field: [val1, val2, ...]}
+        # 同字段多值 = OR，跨字段 = AND，跟全局 search 也 AND
+        if filter_params.field_filters:
+            try:
+                parsed_filters = json.loads(filter_params.field_filters)
+            except (ValueError, TypeError):
+                parsed_filters = None
+
+            if isinstance(parsed_filters, dict):
+                for field_key, raw_values in parsed_filters.items():
+                    sql_column = SEARCHABLE_FIELDS.get(field_key)
+                    if not sql_column:
+                        # 字段不在白名单，静默跳过（避免 SQL 注入和泄露列名）
+                        continue
+                    # 容忍单字符串或 list；过滤空值
+                    if isinstance(raw_values, str):
+                        raw_values = [raw_values]
+                    if not isinstance(raw_values, list):
+                        continue
+                    cleaned = [str(v).strip() for v in raw_values if v is not None and str(v).strip() != ""]
+                    if not cleaned:
+                        continue
+                    or_terms = []
+                    for val in cleaned:
+                        # 列和搜索值都剥空白再 ILIKE，容忍 "A.AFFINIS" vs "A. affinis"
+                        # 这种空格差异。ILIKE 自带大小写无关。
+                        or_terms.append(
+                            f"REGEXP_REPLACE({sql_column}::text, '[[:space:]]+', '', 'g') "
+                            f"ILIKE REGEXP_REPLACE(${param_index}, '[[:space:]]+', '', 'g')"
+                        )
+                        params.append(f"%{val}%")
+                        param_index += 1
+                    where_clauses.append("(" + " OR ".join(or_terms) + ")")
 
         # Add where clauses to query (保持现有逻辑不变)
         if where_clauses:
@@ -537,6 +626,7 @@ async def get_batch_records(
                 "matched_data": {
                     "taxonomic": {
                         "id": record["TaxonID"],
+                        "family": record["matched_family"],
                         "genus": record["matched_genus"],
                         "species": record["matched_species"],
                     },
@@ -554,13 +644,25 @@ async def get_batch_records(
                         "confidence": record["match_confidence"],
                         "suggested_taxon_id": record["matched_taxon_id"],
                         "suggested_data": {
+                            "family": record["suggested_family"],
                             "genus": record["suggested_genus"],
                             "species": record["suggested_species"],
                         } if record["suggested_genus"] or record["suggested_species"] else None,
                         "match_details": match_details,
                         "has_suggestion": record["matched_taxon_id"] is not None,
                         "suggestion_applied": record["TaxonID"] == record["matched_taxon_id"] if record[
-                            "matched_taxon_id"] else False
+                            "matched_taxon_id"] else False,
+                        "family_only": {
+                            "is_family_only": (
+                                (record["verbatim_genus"] is None or str(record["verbatim_genus"]).strip() == "")
+                                and (record["verbatim_species"] is None or str(record["verbatim_species"]).strip() == "")
+                                and record["verbatim_family"] is not None
+                                and str(record["verbatim_family"]).strip() != ""
+                            ),
+                            "verbatim_family_name": record["verbatim_family"],
+                            "matched_family_id": record["verbatim_family_id"],
+                            "exists_in_db": record["verbatim_family_id"] is not None
+                        }
                     }
                 },
                 "record_data": {
@@ -2350,6 +2452,91 @@ async def apply_taxonomic_suggestion(record_id: int):
             code=50000,
             message=f"Failed to apply taxonomic suggestion: {str(e)}"
         )
+
+
+@router.post("/records/{record_id}/apply-family-taxon", response_model=ResponseModel)
+async def apply_family_taxon(record_id: int, payload: ApplyFamilyTaxonModel):
+    """
+    把 family-only 记录关联到一个 family-level taxon（Genus/Species 为空、FamilyID 设上的 TaxonomicTable 行）。
+    如果该 family 还没有这种占位 taxon，自动新建一个，FullScientificName 用 FamilyName。
+    随后写到 primary_temp.TaxonID，并标记 species_verification_status = 'verified'。
+    """
+    try:
+        # 1. 校验 family 存在
+        family_query = """
+        SELECT "FamilyID", "FamilyName" FROM "Family" WHERE "FamilyID" = $1
+        """
+        family_result = await execute_query(family_query, payload.family_id)
+        if not family_result:
+            return ResponseModel(code=40400, message=f"Family {payload.family_id} not found")
+
+        family_name = family_result[0]["FamilyName"]
+
+        # 2. 校验 record 存在
+        record_query = """
+        SELECT "PrimaryID" FROM primary_temp WHERE "PrimaryID" = $1
+        """
+        record_result = await execute_query(record_query, record_id)
+        if not record_result:
+            return ResponseModel(code=40400, message=f"Record {record_id} not found")
+
+        # 3. find-or-create family-level taxon
+        find_query = """
+        SELECT "TaxonID", "FullScientificName"
+        FROM "TaxonomicTable"
+        WHERE "FamilyID" = $1
+          AND ("Genus" IS NULL OR TRIM("Genus") = '')
+          AND ("Species" IS NULL OR TRIM("Species") = '')
+        ORDER BY "TaxonID"
+        LIMIT 1
+        """
+        find_result = await execute_query(find_query, payload.family_id)
+
+        was_created = False
+        if find_result:
+            taxon_id = find_result[0]["TaxonID"]
+            full_scientific_name = find_result[0]["FullScientificName"]
+        else:
+            insert_query = """
+            INSERT INTO "TaxonomicTable" ("FamilyID", "Genus", "Species", "FullScientificName")
+            VALUES ($1, NULL, NULL, $2)
+            RETURNING "TaxonID"
+            """
+            insert_result = await execute_query(insert_query, payload.family_id, family_name)
+            if not insert_result:
+                return ResponseModel(code=50000, message="Failed to create family-level taxon")
+            taxon_id = insert_result[0]["TaxonID"]
+            full_scientific_name = family_name
+            was_created = True
+            await handle_data_change("TaxonomicTable", taxon_id, "INSERT")
+
+        # 4. 应用到 primary_temp
+        apply_query = """
+        UPDATE primary_temp
+        SET "TaxonID" = $1,
+            "species_verification_status" = 'verified',
+            "TimeStampModified" = $2
+        WHERE "PrimaryID" = $3
+        RETURNING "PrimaryID"
+        """
+        apply_result = await execute_query(apply_query, taxon_id, datetime.now(), record_id)
+        if not apply_result:
+            return ResponseModel(code=50000, message="Failed to apply family taxon to record")
+
+        return ResponseModel(
+            code=20000,
+            data={
+                "record_id": record_id,
+                "taxon_id": taxon_id,
+                "family_id": payload.family_id,
+                "family_name": family_name,
+                "full_scientific_name": full_scientific_name,
+                "was_created": was_created
+            },
+            message="Family-level taxon applied successfully"
+        )
+    except Exception as e:
+        return ResponseModel(code=50000, message=f"Failed to apply family taxon: {str(e)}")
 
 
 # Helper function to revalidate a single record after update

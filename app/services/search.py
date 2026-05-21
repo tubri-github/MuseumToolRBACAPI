@@ -428,10 +428,21 @@ async def search_locality(
         search_body["query"]["bool"]["minimum_should_match"] = 1
     else:
         # 高级搜索：处理各个字段的查询
+        # 优先级分配：locality_string > start_date/field_no > 其他文本字段
         if filters:
+            field_boost = {
+                "locality_string": {"phrase": 8, "fuzzy": 3},
+                "field_no":        {"exact": 7},
+                "start_date":      {"exact": 5},
+                "verbatim_collectors": {"phrase": 3, "fuzzy": 1},
+            }
+            default_boost = {"phrase": 2, "fuzzy": 1}
+
             for field, value in filters.items():
                 if not value:
                     continue
+
+                boosts = field_boost.get(field, default_boost)
 
                 # field_no 和 start_date 用精确匹配
                 if field in ["field_no", "start_date"]:
@@ -439,7 +450,7 @@ async def search_locality(
                         "term": {
                             f"{field}.keyword": {
                                 "value": value,
-                                "boost": 10
+                                "boost": boosts["exact"]
                             }
                         }
                     })
@@ -450,7 +461,7 @@ async def search_locality(
                     "match_phrase": {
                         field: {
                             "query": value,
-                            "boost": 3
+                            "boost": boosts["phrase"]
                         }
                     }
                 })
@@ -461,7 +472,7 @@ async def search_locality(
                         field: {
                             "query": value,
                             "fuzziness": "AUTO" if fuzzy else "0",
-                            "boost": 1
+                            "boost": boosts["fuzzy"]
                         }
                     }
                 })

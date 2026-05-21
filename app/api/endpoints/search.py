@@ -246,6 +246,7 @@ async def search_loans_endpoint(
 async def search_locality_endpoint(
         query: Optional[str] = None,
         field_no: Optional[str] = None,
+        locality_string: Optional[str] = None,
         country: Optional[str] = None,
         continent: Optional[str] = None,
         state: Optional[str] = None,
@@ -283,6 +284,7 @@ async def search_locality_endpoint(
     # 构建过滤器对象
     filters = {
         "field_no": field_no,
+        "locality_string": locality_string,
         "country": country,
         "continent": continent,
         "state": state,
