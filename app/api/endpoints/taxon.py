@@ -17,6 +17,12 @@ class TaxonModel(BaseModel):
     familyID: Optional[int] = None
 
 
+class CreateFamilyModel(BaseModel):
+    family_name: str
+    family_number: Optional[str] = None
+    alias2: Optional[str] = None
+
+
 class ResponseModel(BaseModel):
     code: int
     data: Dict[str, Any]
@@ -25,22 +31,137 @@ class ResponseModel(BaseModel):
 @router.get("/taxons/{keyword}", response_model=ResponseModel)
 async def get_taxons(keyword: str):
     """
-    Get taxa by keyword.
-    Mirrors the original getTaxons function.
+    Get taxa by keyword. Returns:
+      1. TaxonomicTable rows joined with Family (so frontend has FamilyName,
+         Genus, Species — enough to identify family-level placeholders).
+      2. Fallback: Family-table-only matches with TaxonID=None. Frontend
+         treats these as "virtual" family-level options and applies them
+         via apply_family_taxon (find-or-create placeholder taxon).
     """
-    query = """
-    SELECT tt."TaxonID", tt."FullScientificName" 
-    FROM "TaxonomicTable" tt 
+    # 1. Main query: TaxonomicTable + Family JOIN, filter by keyword
+    taxon_query = """
+    SELECT
+        tt."TaxonID",
+        tt."FullScientificName",
+        tt."Genus",
+        tt."Species",
+        tt."Subspecies",
+        tt."FamilyID",
+        fam."FamilyName",
+        tt."Remarks"
+    FROM "TaxonomicTable" tt
+    LEFT JOIN "Family" fam ON tt."FamilyID" = fam."FamilyID"
+    WHERE LOWER(tt."FullScientificName") LIKE LOWER('%' || $1 || '%')
+       OR LOWER(COALESCE(fam."FamilyName", '')) LIKE LOWER('%' || $1 || '%')
     ORDER BY similarity(tt."FullScientificName", $1) DESC
+    LIMIT 50
     """
+    taxon_records = await execute_query(taxon_query, keyword)
 
-    records = await execute_query(query, keyword)
+    # 2. Family fallback: skip families that already have a family-level
+    # placeholder in the main results (Genus & Species both empty), so we
+    # don't duplicate. Families that only have genus/species rows are still
+    # surfaced as a virtual family-level option.
+    families_with_placeholder = set()
+    for r in taxon_records:
+        if r["FamilyID"] is None:
+            continue
+        no_genus = not r["Genus"] or str(r["Genus"]).strip() == ""
+        no_species = not r["Species"] or str(r["Species"]).strip() == ""
+        if no_genus and no_species:
+            families_with_placeholder.add(r["FamilyID"])
+
+    family_query = """
+    SELECT "FamilyID", "FamilyName"
+    FROM "Family"
+    WHERE LOWER("FamilyName") LIKE LOWER('%' || $1 || '%')
+      AND NOT ("FamilyID" = ANY($2::int[]))
+    ORDER BY similarity("FamilyName", $1) DESC
+    LIMIT 20
+    """
+    family_records = await execute_query(
+        family_query, keyword, list(families_with_placeholder)
+    )
+
+    # 3. Build unified items list. Virtual entries (TaxonID=None) signal
+    # the frontend to call apply_family_taxon on selection.
+    items = [dict(r) for r in taxon_records]
+    for f in family_records:
+        items.append({
+            "TaxonID": None,
+            "FullScientificName": f["FamilyName"],
+            "Genus": None,
+            "Species": None,
+            "Subspecies": None,
+            "FamilyID": f["FamilyID"],
+            "FamilyName": f["FamilyName"],
+            "Remarks": None,
+        })
 
     return {
         "code": 20000,
         "data": {
-            "items": records,
-            "total": len(records)
+            "items": items,
+            "total": len(items)
+        }
+    }
+
+
+@router.post("/family", response_model=ResponseModel)
+async def create_family(payload: CreateFamilyModel):
+    """
+    Create a new Family record. Used when a verbatim family name is not yet
+    in the Family table (e.g., during batch review of a family-only record).
+
+    Does NOT create a TaxonomicTable placeholder row here — that is created
+    lazily by `apply_family_taxon` when the reviewer actually applies the
+    family to a record. Keeps responsibilities separated.
+    """
+    family_name = payload.family_name.strip() if payload.family_name else ""
+    if not family_name:
+        return {
+            "code": 40000,
+            "data": {},
+            "message": "Family name is required"
+        }
+
+    # Duplicate check (case/whitespace insensitive)
+    check_query = """
+    SELECT "FamilyID", "FamilyName"
+    FROM "Family"
+    WHERE LOWER(TRIM("FamilyName")) = LOWER($1)
+    LIMIT 1
+    """
+    existing = await execute_query(check_query, family_name)
+    if existing:
+        return {
+            "code": 40900,
+            "data": {
+                "family_id": existing[0]["FamilyID"],
+                "family_name": existing[0]["FamilyName"]
+            },
+            "message": f"Family '{existing[0]['FamilyName']}' already exists"
+        }
+
+    insert_query = """
+    INSERT INTO "Family" ("FamilyName", "FamilyNumber", "Alias2", created_at, created_via)
+    VALUES ($1, $2, $3, NOW(), 'reviewer_add')
+    RETURNING "FamilyID", "FamilyName", "FamilyNumber", "Alias2"
+    """
+    family_number = payload.family_number.strip() if payload.family_number else None
+    alias2 = payload.alias2.strip() if payload.alias2 else None
+    result = await execute_query(insert_query, family_name, family_number, alias2)
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create family record")
+
+    return {
+        "code": 20000,
+        "data": {
+            "family_id": result[0]["FamilyID"],
+            "family_name": result[0]["FamilyName"],
+            "family_number": result[0]["FamilyNumber"],
+            "alias2": result[0]["Alias2"]
         }
     }
 
@@ -99,9 +220,10 @@ async def new_taxon(data: TaxonModel):
     """
     query = """
     INSERT INTO "TaxonomicTable" (
-        "Genus", "Species", "Subspecies", "Remarks", "FullScientificName", "FamilyID"
+        "Genus", "Species", "Subspecies", "Remarks", "FullScientificName", "FamilyID",
+        created_at, created_via
     )
-    VALUES ($1, $2, $3, $4, $5, $6)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW(), 'reviewer_create')
     RETURNING "TaxonID"
     """
 

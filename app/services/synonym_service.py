@@ -724,8 +724,11 @@ class SynonymService:
             try:
                 insert_result = await execute_query(
                     """
-                    INSERT INTO "TaxonomicTable" ("Genus", "Species", "FullScientificName")
-                    VALUES ($1, $2, $3)
+                    INSERT INTO "TaxonomicTable" (
+                        "Genus", "Species", "FullScientificName",
+                        created_at, created_via
+                    )
+                    VALUES ($1, $2, $3, NOW(), 'synonym_correction')
                     RETURNING "TaxonID"
                     """,
                     final_genus, final_species or '', final_valid_name.strip()

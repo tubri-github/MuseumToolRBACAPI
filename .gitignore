@@ -1,5 +1,15 @@
 .venv
+venv/
 .env
 .idea
 db/elasticsearch.py
 core/config.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and temp files
+logs/
+temp/

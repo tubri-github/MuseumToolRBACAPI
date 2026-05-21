@@ -508,6 +508,13 @@ async def get_batch_records(
 
         # Field-specific filters: JSON {field: [val1, val2, ...]}
         # 同字段多值 = OR，跨字段 = AND，跟全局 search 也 AND
+        # 支持两个 sentinel 值：
+        #   "__EMPTY__"     → 该字段 IS NULL 或 trim 后为空字符串
+        #   "__NOT_EMPTY__" → 该字段 IS NOT NULL 且 trim 后非空
+        # sentinel 跟普通值在同字段下也是 OR 关系（"empty 或 包含 X" 这种）
+        EMPTY_SENTINEL = "__EMPTY__"
+        NOT_EMPTY_SENTINEL = "__NOT_EMPTY__"
+
         if filter_params.field_filters:
             try:
                 parsed_filters = json.loads(filter_params.field_filters)
@@ -520,16 +527,29 @@ async def get_batch_records(
                     if not sql_column:
                         # 字段不在白名单，静默跳过（避免 SQL 注入和泄露列名）
                         continue
-                    # 容忍单字符串或 list；过滤空值
+                    # 容忍单字符串或 list
                     if isinstance(raw_values, str):
                         raw_values = [raw_values]
                     if not isinstance(raw_values, list):
                         continue
-                    cleaned = [str(v).strip() for v in raw_values if v is not None and str(v).strip() != ""]
-                    if not cleaned:
+
+                    # 分离 sentinel 和普通值
+                    normal_values = []
+                    has_empty = False
+                    has_not_empty = False
+                    for v in raw_values:
+                        if v == EMPTY_SENTINEL:
+                            has_empty = True
+                        elif v == NOT_EMPTY_SENTINEL:
+                            has_not_empty = True
+                        elif v is not None and str(v).strip() != "":
+                            normal_values.append(str(v).strip())
+
+                    if not normal_values and not has_empty and not has_not_empty:
                         continue
+
                     or_terms = []
-                    for val in cleaned:
+                    for val in normal_values:
                         # 列和搜索值都剥空白再 ILIKE，容忍 "A.AFFINIS" vs "A. affinis"
                         # 这种空格差异。ILIKE 自带大小写无关。
                         or_terms.append(
@@ -538,6 +558,14 @@ async def get_batch_records(
                         )
                         params.append(f"%{val}%")
                         param_index += 1
+                    if has_empty:
+                        or_terms.append(
+                            f"({sql_column} IS NULL OR TRIM({sql_column}::text) = '')"
+                        )
+                    if has_not_empty:
+                        or_terms.append(
+                            f"({sql_column} IS NOT NULL AND TRIM({sql_column}::text) <> '')"
+                        )
                     where_clauses.append("(" + " OR ".join(or_terms) + ")")
 
         # Add where clauses to query (保持现有逻辑不变)
@@ -2498,8 +2526,11 @@ async def apply_family_taxon(record_id: int, payload: ApplyFamilyTaxonModel):
             full_scientific_name = find_result[0]["FullScientificName"]
         else:
             insert_query = """
-            INSERT INTO "TaxonomicTable" ("FamilyID", "Genus", "Species", "FullScientificName")
-            VALUES ($1, NULL, NULL, $2)
+            INSERT INTO "TaxonomicTable" (
+                "FamilyID", "Genus", "Species", "FullScientificName",
+                created_at, created_via
+            )
+            VALUES ($1, NULL, NULL, $2, NOW(), 'family_apply_auto')
             RETURNING "TaxonID"
             """
             insert_result = await execute_query(insert_query, payload.family_id, family_name)
