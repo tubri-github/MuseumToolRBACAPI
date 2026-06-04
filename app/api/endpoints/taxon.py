@@ -173,9 +173,12 @@ async def get_family(keyword: str):
     Mirrors the original getFamily function.
     """
     query = """
-    SELECT tt."FamilyID", tt."FamilyName" 
-    FROM "Family" tt 
-    ORDER BY similarity(tt."FamilyName", $1) DESC
+    SELECT tt."FamilyID", tt."FamilyName"
+    FROM "Family" tt
+    WHERE tt."FamilyName" IS NOT NULL
+      AND (tt."FamilyName" ILIKE '%'||$1||'%' OR similarity(tt."FamilyName", $1) > 0.2)
+    ORDER BY (tt."FamilyName" ILIKE $1||'%') DESC, similarity(tt."FamilyName", $1) DESC
+    LIMIT 50
     """
 
     records = await execute_query(query, keyword)

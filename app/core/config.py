@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     # Elasticsearch settings
     ELASTICSEARCH_HOST: str = Field(default="localhost")
     ELASTICSEARCH_PORT: int = Field(default=9200)
+    # 设为 false 可在 ES 未启动时跳过初始化，让 app 照常启动（DB 搜索不依赖 ES）
+    ES_ENABLED: bool = Field(default=True)
 
     # API settings
     API_PREFIX: str = Field(default="/api")

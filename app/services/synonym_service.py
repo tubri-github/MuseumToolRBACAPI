@@ -128,10 +128,19 @@ class SynonymService:
             except Exception:
                 pass
 
+        # Group index: resolved_valid_id → all equivalent names (the accepted name + its synonyms)
+        group_index = {}
+        for info in name_map.values():
+            gid = info.get('resolved_valid_id')
+            if gid is None:
+                continue
+            group_index.setdefault(gid, []).append(info['scientific_name'])
+
         self._taxon_cache = {
             'name_map': name_map,
             'genus_index': genus_index,
             'phonetic_index': phonetic_index,
+            'group_index': group_index,
             'total_count': len(records),
             'synonym_count': synonym_count
         }
@@ -141,6 +150,50 @@ class SynonymService:
             f"{synonym_count} synonyms, {len(genus_index)} genera"
         )
         return self._taxon_cache
+
+    async def resolve_group(self, name: str) -> Dict[str, Any]:
+        """给一个名，返回它在 taxonomy_dev 里的等价名组（接受名 + 全部同义名）。
+        用于 lots 搜索的同义词层 + 来源色标。
+        返回 {found, status: 'valid'|'synonym'|None, accepted_name, names: [所有等价名]}.
+        """
+        if not is_taxon_db_configured():
+            return {'found': False, 'status': None, 'accepted_name': None, 'names': []}
+        cache = await self.load_taxonrank_cache()
+        norm = (name or '').strip().lower()
+        info = cache['name_map'].get(norm)
+        if not info:
+            return {'found': False, 'status': None, 'accepted_name': None, 'names': []}
+        gid = info.get('resolved_valid_id')
+        names = cache['group_index'].get(gid, [info['scientific_name']])
+        return {
+            'found': True,
+            'status': 'synonym' if info.get('is_synonym') else (info.get('status') or 'valid'),
+            'accepted_name': info.get('valid_name'),
+            'names': sorted(set(names))
+        }
+
+    async def tag_status(self, names: List[str]) -> Dict[str, Any]:
+        """批量给一组名打 taxonomy_dev 状态标：返回 {normalized_name: 'valid'|'synonym'}。
+        用于 lots 搜索结果的来源色标。taxonomy_dev 未配置/连不上则返回空（无标签）。
+        """
+        if not is_taxon_db_configured():
+            return {}
+        try:
+            cache = await self.load_taxonrank_cache()
+        except Exception:
+            return {}
+        nm = cache['name_map']
+        out: Dict[str, Any] = {}
+        for n in names:
+            if not n:
+                continue
+            norm = str(n).strip().lower()
+            if norm in out:
+                continue
+            info = nm.get(norm)
+            if info:
+                out[norm] = 'synonym' if info.get('is_synonym') else 'valid'
+        return out
 
     def _find_best_fuzzy_match(
         self, search_name: str, genus_index: Dict, phonetic_index: Dict

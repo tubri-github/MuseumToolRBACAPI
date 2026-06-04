@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin, data_file_processor, batch_review, taxon_review
 from app.db.elasticsearch import init_es, close_es
+from app.core.config import settings
 from app.middleware.request_logging import RequestLoggingMiddleware
 
 app = FastAPI(
@@ -49,11 +50,21 @@ app.include_router(taxon_review.router, prefix="/api/synonym-review", tags=["Syn
 #
 @app.on_event("startup")
 async def startup_db_client():
-    await init_es()
+    # ES 未启用时直接跳过；启用但连不上时也不让整个 app 起不来（DB 搜索不依赖 ES）
+    if not settings.ES_ENABLED:
+        print("[startup] ES_ENABLED=false, skipping Elasticsearch init")
+        return
+    try:
+        await init_es()
+    except Exception as e:
+        print(f"[startup] Elasticsearch init failed, continuing without ES: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    await close_es()
+    try:
+        await close_es()
+    except Exception as e:
+        print(f"[shutdown] Elasticsearch close failed: {e}")
 
 @app.get("/")
 async def root():
