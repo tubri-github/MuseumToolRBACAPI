@@ -2,17 +2,35 @@ import asyncio
 import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from app.db.database import execute_query, execute_mutation, execute_transaction
+from app.db.database import execute_query, execute_mutation, execute_transaction, get_db
 
 
 class DatabaseUtils:
     """数据库操作工具类"""
 
     @staticmethod
+    async def _allocate_catalog_base(conn) -> int:
+        """
+        在一个【已开启的事务】内调用：锁住 Primary 并返回当前 MAX("CatalogNumber")。
+        调用方随后在【同一事务】里用 base+1..base+N 连号插入 —— 锁一直持有到事务提交，
+        因此「分配号段」与「写入 Primary」原子化，杜绝并发撞号，且每批号段连续。
+        （把 base 留在代码里算，未来想改成"回收空号/找洞补号"也只动这一处。）
+        """
+        await conn.execute('LOCK TABLE "Primary" IN ACCESS EXCLUSIVE MODE')
+        return await conn.fetchval('SELECT COALESCE(MAX("CatalogNumber"), 0) FROM "Primary"')
+
+    @staticmethod
     async def get_next_catalog_numbers(count: int) -> List[int]:
         """
         获取一批下一个可用的编目号，并锁定以防止冲突
         使用事务确保在高并发下不会重复
+
+        TODO(并发撞号): 这里的锁是【无效的】—— LOCK 在本事务内只读 MAX、随即 commit 放锁，
+        真正的 INSERT INTO "Primary" 发生在另一个事务里。两个并发分配会读到同一个 MAX，
+        拿到重叠号段而撞号（复现见 test_catalog_concurrency.py）。迁移路径(#1
+        migrate_batch_from_temp_to_primary)已改为 _allocate_catalog_base + 同事务插入。
+        本函数的剩余调用方(insert_primary_records #2、process_direct_import #3)尚未迁移。
+        正确做法：在【已开启的、随后做 INSERT 的同一事务】里调用 _allocate_catalog_base(conn)。
         """
         try:
             # 准备事务中的SQL语句
@@ -334,6 +352,9 @@ class DatabaseUtils:
         if not records:
             return []
 
+        # TODO(#2 并发撞号): 直接导入路径仍用旧的两段式分配，存在并发撞号风险
+        #   (见 get_next_catalog_numbers 的 TODO)。待改为：用 get_db() 开事务 →
+        #   _allocate_catalog_base(conn) → 在同事务内 base+i+1 连号插入。暂缓。
         # 获取正式的 catalog numbers
         catalog_numbers = await DatabaseUtils.get_next_catalog_numbers(len(records))
 
@@ -494,7 +515,7 @@ class DatabaseUtils:
             check_query = """
             SELECT
                 COUNT(*) as total_records,
-                SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as verified_records,
+                SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as verified_records,
                 SUM(CASE WHEN "overall_verification_status" = 'completed' THEN 1 ELSE 0 END) as fully_verified_records,
                 SUM(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as already_migrated
             FROM primary_temp
@@ -530,18 +551,15 @@ class DatabaseUtils:
             if not temp_records:
                 raise Exception(f"No unmigrated records found for batch {batch_serial_id}")
 
-            # 3. 获取正式的 catalog numbers
-            catalog_numbers = await DatabaseUtils.get_next_catalog_numbers(len(temp_records))
+            # 3-6. 在【单个事务】内完成：锁 Primary → 算连号 base → 插入 Primary
+            #      → 回填 primary_temp 映射 → 迁移 preparation_temp。
+            #      锁持有到事务提交，与其它迁移/导入并发时也不会撞 catalog number，
+            #      且每批号段连续（base+1 .. base+N）。
+            primary_id_map = {}      # primary_temp.PrimaryID -> Primary.PrimaryID
+            temp_id_to_catalog = {}  # primary_temp.PrimaryID -> 正式 catalog number
+            prep_temp_records = []
 
-            # 4. 批量插入到 Primary 表
-            statements = []
-            temp_id_to_catalog = {}  # 映射临时ID到正式catalog number
-
-            for i, temp_record in enumerate(temp_records):
-                catalog_number = catalog_numbers[i]
-                temp_id_to_catalog[temp_record['PrimaryID']] = catalog_number
-
-                insert_primary_sql = """
+            insert_primary_sql = """
                 INSERT INTO "Primary" (
                     "CatalogNumber", "verbatim_taxonid", "verbatim_localityid",
                     "TaxonID", "Locality1ID", "TotalNumber", "Storage",
@@ -552,119 +570,95 @@ class DatabaseUtils:
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW()
                 ) RETURNING "PrimaryID"
-                """
-
-                params = [
-                    catalog_number,
-                    temp_record.get('verbatim_taxonid'),
-                    temp_record.get('verbatim_localityid'),
-                    temp_record.get('TaxonID'),
-                    temp_record.get('Locality1ID'),
-                    temp_record.get('TotalNumber', 1),
-                    temp_record.get('Storage'),
-                    temp_record.get('JarSize'),
-                    temp_record.get('PrevNumber'),
-                    temp_record.get('Inventory'),
-                    temp_record.get('Remarks'),
-                    temp_record.get('match_type'),
-                    False,  # 正式导入后不需要review
-                    batch_serial_id,
-                    temp_record.get('species_verification_status'),
-                    temp_record.get('locality_verification_status'),
-                    temp_record.get('record_verification_status')
-                ]
-
-                statements.append({
-                    "sql": insert_primary_sql,
-                    "params": params
-                })
-
-            # 执行插入
-            insert_results = await execute_transaction(statements)
-
-            # 5. 更新 primary_temp 表，记录映射关系
-            update_statements = []
-            primary_id_map = {}  # 映射 primary_temp.PrimaryID 到 Primary.PrimaryID
-
-            for i, temp_record in enumerate(temp_records):
-                if insert_results[i] and len(insert_results[i]) > 0:
-                    primary_id = insert_results[i][0]['PrimaryID']
-                    temp_id = temp_record['PrimaryID']
-                    primary_id_map[temp_id] = primary_id
-
-                    update_temp_sql = """
-                    UPDATE primary_temp
-                    SET final_catalog_number = $1,
-                        final_primary_id = $2,
-                        "TimeStampModified" = NOW()
-                    WHERE "PrimaryID" = $3
-                    """
-
-                    update_statements.append({
-                        "sql": update_temp_sql,
-                        "params": [catalog_numbers[i], primary_id, temp_id]
-                    })
-
-            await execute_transaction(update_statements)
-
-            # 6. 迁移 preparation_temp 记录
-            fetch_prep_temp_query = """
-            SELECT pt.* FROM preparation_temp pt
-            INNER JOIN primary_temp prt ON pt."PrimaryID" = prt."PrimaryID"
-            WHERE prt.batch_serial_id = $1 AND pt.final_preparation_id IS NULL
             """
 
-            prep_temp_records = await execute_query(fetch_prep_temp_query, batch_serial_id)
+            async with get_db() as conn:
+                async with conn.transaction():
+                    # 锁 Primary + 读 MAX 作为连号起点（同一事务，锁撑到提交）
+                    base = await DatabaseUtils._allocate_catalog_base(conn)
 
-            if prep_temp_records:
-                prep_statements = []
+                    # 4. 插入 Primary（CatalogNumber = base + i + 1，连号）并回填 primary_temp
+                    for i, temp_record in enumerate(temp_records):
+                        catalog_number = base + i + 1
+                        temp_id = temp_record['PrimaryID']
+                        temp_id_to_catalog[temp_id] = catalog_number
 
-                for prep_temp in prep_temp_records:
-                    primary_temp_id = prep_temp['PrimaryID']
-                    if primary_temp_id in primary_id_map:
-                        primary_id = primary_id_map[primary_temp_id]
+                        primary_id = await conn.fetchval(
+                            insert_primary_sql,
+                            catalog_number,
+                            temp_record.get('verbatim_taxonid'),
+                            temp_record.get('verbatim_localityid'),
+                            temp_record.get('TaxonID'),
+                            temp_record.get('Locality1ID'),
+                            temp_record.get('TotalNumber', 1),
+                            temp_record.get('Storage'),
+                            temp_record.get('JarSize'),
+                            temp_record.get('PrevNumber'),
+                            temp_record.get('Inventory'),
+                            temp_record.get('Remarks'),
+                            temp_record.get('match_type'),
+                            False,  # 正式导入后不需要review
+                            batch_serial_id,
+                            temp_record.get('species_verification_status'),
+                            temp_record.get('locality_verification_status'),
+                            temp_record.get('record_verification_status'),
+                        )
+                        primary_id_map[temp_id] = primary_id
 
-                        insert_prep_sql = """
-                        INSERT INTO "Preparation" (
-                            "PrimaryID", "PreparationType", "Count"
-                        ) VALUES ($1, $2, $3)
-                        RETURNING "PreparationID"
-                        """
+                        # 5. 回填 primary_temp 映射关系
+                        await conn.execute(
+                            '''
+                            UPDATE primary_temp
+                            SET final_catalog_number = $1,
+                                final_primary_id = $2,
+                                "TimeStampModified" = NOW()
+                            WHERE "PrimaryID" = $3
+                            ''',
+                            catalog_number, primary_id, temp_id,
+                        )
 
-                        prep_statements.append({
-                            "sql": insert_prep_sql,
-                            "params": [primary_id, prep_temp.get('PreparationType', 'Fluid'), prep_temp.get('Count', 1)]
-                        })
+                    # 6. 迁移 preparation_temp 记录（同一事务）
+                    prep_temp_records = await conn.fetch(
+                        '''
+                        SELECT pt.* FROM preparation_temp pt
+                        INNER JOIN primary_temp prt ON pt."PrimaryID" = prt."PrimaryID"
+                        WHERE prt.batch_serial_id = $1 AND pt.final_preparation_id IS NULL
+                        ''',
+                        batch_serial_id,
+                    )
 
-                prep_results = await execute_transaction(prep_statements)
+                    for prep_temp in prep_temp_records:
+                        primary_temp_id = prep_temp['PrimaryID']
+                        if primary_temp_id not in primary_id_map:
+                            continue
 
-                # 更新 preparation_temp
-                update_prep_statements = []
-                for i, prep_temp in enumerate(prep_temp_records):
-                    if prep_results[i] and len(prep_results[i]) > 0:
-                        prep_id = prep_results[i][0]['PreparationID']
-
-                        update_prep_sql = """
-                        UPDATE preparation_temp
-                        SET final_preparation_id = $1,
-                            "TimeStampModified" = NOW()
-                        WHERE "PreparationID" = $2
-                        """
-
-                        update_prep_statements.append({
-                            "sql": update_prep_sql,
-                            "params": [prep_id, prep_temp['PreparationID']]
-                        })
-
-                await execute_transaction(update_prep_statements)
+                        prep_id = await conn.fetchval(
+                            '''
+                            INSERT INTO "Preparation" ("PrimaryID", "PreparationType", "Count")
+                            VALUES ($1, $2, $3)
+                            RETURNING "PreparationID"
+                            ''',
+                            primary_id_map[primary_temp_id],
+                            prep_temp.get('PreparationType', 'Fluid'),
+                            prep_temp.get('Count', 1),
+                        )
+                        await conn.execute(
+                            '''
+                            UPDATE preparation_temp
+                            SET final_preparation_id = $1,
+                                "TimeStampModified" = NOW()
+                            WHERE "PreparationID" = $2
+                            ''',
+                            prep_id, prep_temp['PreparationID'],
+                        )
 
             return {
                 "batch_serial_id": batch_serial_id,
                 "migrated_count": len(temp_records),
                 "preparation_migrated_count": len(prep_temp_records) if prep_temp_records else 0,
                 "catalog_number_range": {
-                    "start": catalog_numbers[0],
-                    "end": catalog_numbers[-1]
+                    "start": base + 1,
+                    "end": base + len(temp_records)
                 },
                 "timestamp": datetime.now().isoformat()
             }

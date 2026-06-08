@@ -171,7 +171,7 @@ async def get_verbatim_batches(
                COUNT(*) as total_records,
                SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
                SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-               SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+               SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
                MAX(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as is_migrated
         FROM primary_temp
         WHERE batch_serial_id IS NOT NULL
@@ -194,7 +194,7 @@ async def get_verbatim_batches(
                 EXISTS (
                     SELECT 1 FROM primary_temp p2
                     WHERE p2.batch_serial_id = primary_temp.batch_serial_id
-                    AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
+                    AND COALESCE(p2."overall_verification_status", 'pending') != 'completed'
                 )
                 """)
             elif filter_params.status == 'completed':
@@ -202,7 +202,7 @@ async def get_verbatim_batches(
                 NOT EXISTS (
                     SELECT 1 FROM primary_temp p2
                     WHERE p2.batch_serial_id = primary_temp.batch_serial_id
-                    AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
+                    AND COALESCE(p2."overall_verification_status", 'pending') != 'completed'
                 )
                 """)
             elif filter_params.status == 'migrated':
@@ -301,7 +301,7 @@ async def get_batch_info(batch_serial_id: str):
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records
         FROM primary_temp
         WHERE batch_serial_id = $1
@@ -482,7 +482,7 @@ async def get_batch_records(
             elif filter_params.status == 'pending_record':
                 where_clauses.append('COALESCE(p."record_verification_status", \'pending\') = \'pending\'')
             elif filter_params.status == 'pending_any':
-                where_clauses.append('(p."TaxonID" IS NULL OR p."Locality1ID" IS NULL)')
+                where_clauses.append('p."TaxonID" IS NULL')
             elif filter_params.status == 'completed':
                 where_clauses.append('COALESCE(p."overall_verification_status", \'pending\') = \'completed\'')
             elif filter_params.status == 'needs_review':
@@ -717,7 +717,7 @@ async def get_batch_records(
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             SUM(CASE WHEN "species_verification_status" = 'verified' THEN 1 ELSE 0 END) as species_verified,
             SUM(CASE WHEN "locality_verification_status" = 'verified' THEN 1 ELSE 0 END) as locality_verified,
             SUM(CASE WHEN "record_verification_status" = 'verified' THEN 1 ELSE 0 END) as record_verified,
@@ -1510,7 +1510,7 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
         record_status = update_data.record_verification_status if hasattr(update_data, "record_verification_status") and update_data.record_verification_status else existing_record.get("record_verification_status", "pending")
 
         # 计算overall状态：只有当三个都是verified时才是completed
-        if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+        if species_status == "verified" and record_status == "verified":
             overall_status = "completed"
         else:
             overall_status = "pending"
@@ -1995,7 +1995,7 @@ async def get_batch_progress(batch_serial_id: str):
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records
         FROM primary_temp
         WHERE batch_serial_id = $1
@@ -2251,7 +2251,7 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
             SUM(CASE WHEN NOT EXISTS (
                 SELECT 1 FROM primary_temp p2
                 WHERE p2.batch_serial_id = p1.batch_serial_id
-                AND (p2."TaxonID" IS NULL OR p2."Locality1ID" IS NULL)
+                AND COALESCE(p2."overall_verification_status", 'pending') != 'completed'
             ) THEN 1 ELSE 0 END) as completed_batches
         FROM (
             SELECT DISTINCT batch_serial_id
@@ -2268,7 +2268,7 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             COUNT(DISTINCT batch_serial_id) as batches_count
         FROM primary_temp
         WHERE "TimeStampModified" >= NOW() - INTERVAL '%s days'
@@ -2283,7 +2283,7 @@ async def get_verbatim_statistics(days: int = Query(30, ge=1, le=365)):
             COUNT(*) as total_records,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
-            SUM(CASE WHEN "TaxonID" IS NOT NULL AND "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
+            SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
             MIN("TimeStampModified") as import_date,
             MAX("TimeStampModified") as last_modified
         FROM primary_temp
@@ -2664,7 +2664,7 @@ async def revalidate_single_record(record_id: int):
             species_status = status_result[0].get("species_verification_status", "pending")
             locality_status = status_result[0].get("locality_verification_status", "pending")
 
-            if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+            if species_status == "verified" and record_status == "verified":
                 overall_status = "completed"
             else:
                 overall_status = "pending"

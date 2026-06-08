@@ -602,7 +602,7 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
 
             # 4. 计算overall status
             overall_status = "pending"
-            if species_status == "verified" and locality_status == "verified" and record_status == "verified":
+            if species_status == "verified" and record_status == "verified":
                 overall_status = "completed"
 
             # 5. 构建更新语句
@@ -748,6 +748,10 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
             })
             return
 
+        # TODO(#3 冗余 + 并发撞号): 这里算的 catalog number 其实没用 ——
+        #   下面 insert_primary_records 内部会【再分配一次】并用它自己的号，
+        #   record["catalog_number"] 没有任何下游读取。等 #2 改造时一并删掉这段，
+        #   并发撞号的根治也在 #2(见 db_import.insert_primary_records 的 TODO)。暂缓。
         # 获取编目号
         catalog_numbers = await db_utils.get_next_catalog_numbers(len(valid_records))
 
@@ -993,6 +997,9 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
         print(f"插入 {len(verbatim_locality_records)} 条 verbatim locality 记录...")
         verbatim_locality_ids = await db_utils.insert_verbatim_locality_records(verbatim_locality_records)
 
+        # TODO(#4 死分配): verbatim 导入写的是 primary_temp，它会【自己生成临时字符串号】
+        #   {batch}-{seq}(见 insert_primary_temp_records)，这里算的官方整数号根本没人用。
+        #   官方号要等批次迁移(#1)时才真正生成。可直接删掉本次分配。暂缓清理。
         # 5. 获取编目号
         catalog_numbers = await db_utils.get_next_catalog_numbers(len(valid_records))
 

@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
-from app.db.database import execute_query, execute_mutation, execute_proc, execute_paginated_query_with_count
+from app.db.database import execute_query, execute_mutation, execute_proc, execute_paginated_query_with_count, execute_transaction, get_db
 from app.services.es_sync import handle_data_change
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 from app.services.synonym_service import SynonymService
@@ -114,6 +114,8 @@ class LotModel(BaseModel):
     localityId: Optional[int] = None
     catalogerId: Optional[int] = None
     totalNumber: Optional[int] = None
+    collection: Optional[str] = None  # 节点的 collection 类型。root: fluid|osteology|tissue；子节点: osteology|tissue
+    parentId: Optional[int] = None    # 有值=建子节点(挂在该 PrimaryID 下)；无=建 root lot
     preparation: Optional[List[Dict[str, Any]]] = None
     zDetermination: Optional[List[Dict[str, Any]]] = None
     oldDeterminationDetails: Optional[List[Dict[str, Any]]] = None
@@ -157,34 +159,41 @@ LOTS_SPEC = FilterSpec(
         LEFT JOIN "TaxonomicTable" tt ON tt."TaxonID" = d."TaxonID"
         LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID"
         LEFT JOIN locality1 l ON l."Locality1ID" = p."Locality1ID"
+        LEFT JOIN verbatim_locality vl ON vl."verbatim_localityid" = p."verbatim_localityid"
+        LEFT JOIN verbatim_taxonomic vtx ON vtx."verbatim_taxonid" = p."verbatim_taxonid"
     """,
     select="""
         p."PrimaryID", p."CatalogNumber", p."PrevNumber", p."DateCataloged",
         p."JarSize", p."Storage", p."TypeStatus", p."Inventory", p."TotalNumber",
         p."Remarks", p."Locality1ID", p."CatalogerID", p."TimeStampModified",
+        p."parent_id", p."collection", p."identifier",
         d."TaxonID", tt."FullScientificName", tt."Genus", tt."Species", tt."Subspecies",
         f."FamilyID", f."FamilyName", f."FamilyNumber",
         l."FieldNo", l."LocalityString", l."Country", l."State", l."County",
         l."Drainage", l."WaterBody", l."Lat", l."Lon", l."StartDate", l."VerbatimDate",
+        vl."verbatim_locality_string", vl."verbatim_country", vl."verbatim_state",
+        vl."verbatim_county", vl."verbatim_drainage", vl."verbatim_waterbody", vl."verbatim_fieldno",
+        vtx."verbatim_family", vtx."verbatim_genus", vtx."verbatim_species",
         (SELECT string_agg(DISTINCT pp."PreparationType", ', ')
            FROM "Preparation" pp WHERE pp."PrimaryID" = p."PrimaryID") AS "Preparations",
         (SELECT SUM(pp."Count")
-           FROM "Preparation" pp WHERE pp."PrimaryID" = p."PrimaryID") AS "PrepCount"
+           FROM "Preparation" pp WHERE pp."PrimaryID" = p."PrimaryID") AS "PrepCount",
+        (SELECT COUNT(*) FROM "Primary" c WHERE c.parent_id = p."PrimaryID") AS "ChildCount"
     """,
     order_by='p."PrimaryID" DESC',
     fields={
-        "catalog_number":  FieldDef('p."CatalogNumber"', "idlist", "Catalog No.", "标本 Specimen"),
-        "prev_number":     FieldDef('p."PrevNumber"', "text", "Prev Number", "标本 Specimen"),
-        "jar_size":        FieldDef('p."JarSize"', "enum", "Jar Size", "标本 Specimen"),
-        "storage":         FieldDef('p."Storage"', "enum", "Storage", "标本 Specimen"),
-        "type_status":     FieldDef('p."TypeStatus"', "text", "Type Status", "标本 Specimen"),
-        "inventory":       FieldDef('p."Inventory"', "text", "Inventory", "标本 Specimen"),
-        "total_number":    FieldDef('p."TotalNumber"', "number", "Total Number", "标本 Specimen"),
-        "remarks":         FieldDef('p."Remarks"', "text", "Remarks", "标本 Specimen"),
-        "family":          FieldDef('f."FamilyName"', "text", "Family", "分类 Taxonomy"),
-        "genus":           FieldDef('tt."Genus"', "text", "Genus", "分类 Taxonomy"),
-        "species":         FieldDef('tt."Species"', "text", "Species", "分类 Taxonomy"),
-        "scientific_name": FieldDef('tt."FullScientificName"', "text", "Scientific Name", "分类 Taxonomy"),
+        "catalog_number":  FieldDef('p."CatalogNumber"', "idlist", "Catalog No.", "Specimen"),
+        "prev_number":     FieldDef('p."PrevNumber"', "text", "Prev Number", "Specimen"),
+        "jar_size":        FieldDef('p."JarSize"', "enum", "Jar Size", "Specimen"),
+        "storage":         FieldDef('p."Storage"', "enum", "Storage", "Specimen"),
+        "type_status":     FieldDef('p."TypeStatus"', "text", "Type Status", "Specimen"),
+        "inventory":       FieldDef('p."Inventory"', "text", "Inventory", "Specimen"),
+        "total_number":    FieldDef('p."TotalNumber"', "number", "Total Number", "Specimen"),
+        "remarks":         FieldDef('p."Remarks"', "text", "Remarks", "Specimen"),
+        "family":          FieldDef('f."FamilyName"', "text", "Family", "Taxonomy"),
+        "genus":           FieldDef('tt."Genus"', "text", "Genus", "Taxonomy"),
+        "species":         FieldDef('tt."Species"', "text", "Species", "Taxonomy"),
+        "scientific_name": FieldDef('tt."FullScientificName"', "text", "Scientific Name", "Taxonomy"),
         # 鉴定限定词（开放命名法）：从 Species 派生。affinis 是真实种名，故 aff. 用词边界正则避开它。
         "id_qualifier": FieldDef(
             """CASE
@@ -197,16 +206,27 @@ LOTS_SPEC = FilterSpec(
                 WHEN tt."Species" ILIKE 'indet%' THEN 'indet.'
                 WHEN tt."Species" ILIKE 'sp.%' OR tt."Species" IN ('sp', 'sp.') THEN 'sp.'
                 ELSE 'determined' END""",
-            "enum", "ID Qualifier", "分类 Taxonomy",
+            "enum", "ID Qualifier", "Taxonomy",
             options=["determined", "sp.", "spp.", "cf.", "aff.", "nr.", "sp. nov.", "indet."]),
-        "field_no":        FieldDef('l."FieldNo"', "text", "Field No.", "产地 Locality"),
-        "locality_string": FieldDef('l."LocalityString"', "text", "Locality String", "产地 Locality"),
-        "country":         FieldDef('l."Country"', "text", "Country", "产地 Locality"),
-        "state":           FieldDef('l."State"', "text", "State", "产地 Locality"),
-        "county":          FieldDef('l."County"', "text", "County", "产地 Locality"),
-        "drainage":        FieldDef('l."Drainage"', "text", "Drainage", "产地 Locality"),
-        "water_body":      FieldDef('l."WaterBody"', "text", "Water Body", "产地 Locality"),
-        "date_cataloged":  FieldDef('p."DateCataloged"', "date", "Date Cataloged", "日期 Dates"),
+        "field_no":        FieldDef('l."FieldNo"', "text", "Field No.", "Locality"),
+        "locality_string": FieldDef('l."LocalityString"', "text", "Locality String", "Locality"),
+        "country":         FieldDef('l."Country"', "text", "Country", "Locality"),
+        "state":           FieldDef('l."State"', "text", "State", "Locality"),
+        "county":          FieldDef('l."County"', "text", "County", "Locality"),
+        "drainage":        FieldDef('l."Drainage"', "text", "Drainage", "Locality"),
+        "water_body":      FieldDef('l."WaterBody"', "text", "Water Body", "Locality"),
+        "date_cataloged":  FieldDef('p."DateCataloged"', "date", "Date Cataloged", "Dates"),
+        # verbatim（原始著录）—— 只暴露与上面已显示 Primary 字段对应的 verbatim 列
+        "verbatim_family":          FieldDef('vtx."verbatim_family"', "text", "Family (verbatim)", "Verbatim"),
+        "verbatim_genus":           FieldDef('vtx."verbatim_genus"', "text", "Genus (verbatim)", "Verbatim"),
+        "verbatim_species":         FieldDef('vtx."verbatim_species"', "text", "Species (verbatim)", "Verbatim"),
+        "verbatim_field_no":        FieldDef('vl."verbatim_fieldno"', "text", "Field No. (verbatim)", "Verbatim"),
+        "verbatim_locality_string": FieldDef('vl."verbatim_locality_string"', "text", "Locality String (verbatim)", "Verbatim"),
+        "verbatim_country":         FieldDef('vl."verbatim_country"', "text", "Country (verbatim)", "Verbatim"),
+        "verbatim_state":           FieldDef('vl."verbatim_state"', "text", "State (verbatim)", "Verbatim"),
+        "verbatim_county":          FieldDef('vl."verbatim_county"', "text", "County (verbatim)", "Verbatim"),
+        "verbatim_drainage":        FieldDef('vl."verbatim_drainage"', "text", "Drainage (verbatim)", "Verbatim"),
+        "verbatim_water_body":      FieldDef('vl."verbatim_waterbody"', "text", "Water Body (verbatim)", "Verbatim"),
     },
     global_search_cols=[
         "catalog_number", "prev_number", "scientific_name", "genus", "species", "family",
@@ -222,9 +242,9 @@ async def get_lots_filter_metadata():
     映射到 taxon_id/family_id + 三层开关，不走通用 SQL 过滤）。
     """
     fields = LOTS_SPEC.to_metadata() + [
-        {"key": "taxon_pick", "label": "Scientific Name (taxon match)", "group": "分类 Taxonomy",
+        {"key": "taxon_pick", "label": "Scientific Name (taxon match)", "group": "Taxonomy",
          "type": "taxon", "operators": ["match"]},
-        {"key": "family_pick", "label": "Family (taxon match)", "group": "分类 Taxonomy",
+        {"key": "family_pick", "label": "Family (taxon match)", "group": "Taxonomy",
          "type": "family", "operators": ["match"]},
     ]
     return {"code": 20000, "data": {"fields": fields}}
@@ -299,15 +319,24 @@ async def get_lots(ids: str, pagination: PaginationParams = Depends()):
     Mirrors the original getLots function.
     """
     id_list = [int(id_str) for id_str in ids.split(',') if id_str]
+    # 展平为直接 JOIN（ON 用真实表别名，避免旧版嵌套子查询里 "TaxonID" 等列名歧义报错）；
+    # 只取当前鉴定（IsCurrent=true），一条 lot 一行；冲突列加别名（CurrentTaxonID/PrimaryRemarks）。
     query = """
-        SELECT * FROM (
-            (((SELECT p."PrimaryID" as "MainPrimaryID", p."Remarks" as "PrimaryRemarks", p.* 
-              FROM "Primary" p 
-              WHERE p."CatalogNumber" = ANY($1::int[])) a 
-             LEFT JOIN "Determination" d2 ON d2."PrimaryID" = a."PrimaryID") join1 
-            LEFT JOIN locality1 l ON l."Locality1ID" = join1."Locality1ID") join2 
-           LEFT JOIN "TaxonomicTable" tt ON tt."TaxonID" = join2."TaxonID") join3 
-        LEFT JOIN "Family" f ON f."FamilyID" = join3."FamilyID"
+        SELECT
+            p."PrimaryID" AS "MainPrimaryID",
+            p."Remarks" AS "PrimaryRemarks",
+            p.*,
+            l."LocalityString",
+            l."FieldNo",
+            d."TaxonID" AS "CurrentTaxonID",
+            tt."FullScientificName",
+            f."FamilyName"
+        FROM "Primary" p
+        LEFT JOIN "Determination" d ON d."PrimaryID" = p."PrimaryID" AND d."IsCurrent" = true
+        LEFT JOIN locality1 l ON l."Locality1ID" = p."Locality1ID"
+        LEFT JOIN "TaxonomicTable" tt ON tt."TaxonID" = d."TaxonID"
+        LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID"
+        WHERE p."CatalogNumber" = ANY($1::int[])
         """
     count_query = """
             SELECT COUNT(*) FROM "Primary" 
@@ -321,6 +350,31 @@ async def get_lots(ids: str, pagination: PaginationParams = Depends()):
         page=pagination.page,
         page_size=pagination.page_size
     )
+
+
+@router.get("/lot-by-primary/{primary_id}", response_model=ResponseModel)
+async def get_lot_by_primary(primary_id: int):
+    """按 PrimaryID 取单条 lot 的编辑数据（root 或子节点都行 —— 子节点没有 CatalogNumber，
+    edit 必须用 PrimaryID）。返回结构同 /lot/{ids}/{limit}（items[0]）。"""
+    query = """
+        SELECT
+            p."PrimaryID" AS "MainPrimaryID",
+            p."Remarks" AS "PrimaryRemarks",
+            p.*,
+            l."LocalityString",
+            l."FieldNo",
+            d."TaxonID" AS "CurrentTaxonID",
+            tt."FullScientificName",
+            f."FamilyName"
+        FROM "Primary" p
+        LEFT JOIN "Determination" d ON d."PrimaryID" = p."PrimaryID" AND d."IsCurrent" = true
+        LEFT JOIN locality1 l ON l."Locality1ID" = p."Locality1ID"
+        LEFT JOIN "TaxonomicTable" tt ON tt."TaxonID" = d."TaxonID"
+        LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID"
+        WHERE p."PrimaryID" = $1
+        """
+    records = await execute_query(query, primary_id)
+    return {"code": 20000, "data": {"items": records, "total": len(records)}}
 
 
 @router.get("/lotString/{catid}", response_model=ResponseModel)
@@ -488,6 +542,7 @@ async def get_lots_advanced(
         fuzzy_threshold: float = Query(0.4, ge=0.0, le=1.0, description="全局框 trigram 相似度阈值；0.4 时 percida✓/percda✗"),
         taxon_id: Optional[int] = Query(None, description="typeahead 选中的物种 TaxonID"),
         family_id: Optional[int] = Query(None, description="typeahead 选中的 FamilyID"),
+        parent_id: Optional[int] = Query(None, description="有值=取该 PrimaryID 的直接子节点（展开树用）；无=顶层只返回根记录"),
         incl_similar: bool = Query(False, description="taxon 搜索是否含「相似写法」层（tier②）"),
         incl_synonym: bool = Query(True, description="taxon/family 搜索是否含「同义/接受名」层（tier③）"),
         pagination: PaginationParams = Depends(),
@@ -531,6 +586,13 @@ async def get_lots_advanced(
     )
     where_clauses.extend(w2)
     params.extend(p2)
+
+    # 树：顶层只显示根（parent_id IS NULL）；展开时按 parent_id 取直接子节点。
+    # parent_id 是 FastAPI 校验过的 int，安全内联（不占参数位）。
+    if parent_id is not None:
+        where_clauses.append(f'p.parent_id = {int(parent_id)}')
+    else:
+        where_clauses.append('p.parent_id IS NULL')
 
     # taxon typeahead：三层 TaxonID（① 精确 ② 相似 ③ 同义词）。id 来自 DB，用字面量数组拼，不占参数位。
     taxon_order = None
@@ -640,34 +702,65 @@ async def get_preparation_by_primary_id(primaryID: int):
     }
 
 
+# 可以作为根 lot 的 collection 类型。image 永远是子节点(凭证叶子),不能当 root;
+# fluid 是缺省(整鱼/液浸)。见 collection 树规则(migrations/add_collection_tree.sql)。
+ROOT_COLLECTIONS = {"fluid", "osteology", "tissue"}
+# 可作为子节点(完整记录)的 collection。image 暂不走此表单(留给单独的图片上传页)。
+SUB_LOT_COLLECTIONS = {"osteology", "tissue"}
+
+
+def _normalize_determinations(zdet) -> list:
+    """把前端 zDetermination 规整成统一结构(root 和子节点共用)。"""
+    out = []
+    for det in (zdet or []):
+        out.append({
+            "isCurrent": det.get("isCurrent", False),
+            "taxonId": det.get("taxonId") or None,
+            "determinerID": (det.get("determination", {}) or {}).get("determinerID") or None,
+            "determinerName": (det.get("determination", {}) or {}).get("determinerName") or None,
+            "date": det.get("date") or None,
+            "remarks": det.get("remarks") or None,
+        })
+    return out
+
+
+def _normalize_preparations(preps) -> list:
+    """把前端 preparation 规整(root 和子节点共用)。空 count -> None(否则 ::INTEGER 报错);
+    跳过完全空的行(表单默认会带一行空的)。"""
+    out = []
+    for prep in (preps or []):
+        ptype = prep.get("preparationType") or None
+        pcount = prep.get("count")
+        pcount = None if pcount in (None, "") else pcount
+        if ptype is None and pcount is None:
+            continue
+        out.append({"preparationType": ptype, "count": pcount})
+    return out
+
+
 @router.post("/lot", response_model=ResponseModel)
 async def new_lot(data: LotModel):
     """
-    Create a new lot.
-    Mirrors the original newLot function.
+    Create a new lot (root) — or, when parentId is set, a full sub-record node in the
+    collection tree (same form/payload, just linked under a parent with an identifier).
     """
     try:
-        # Convert determination data to JSON
-        determinations = []
-        for det in data.zDetermination:
-            determinations.append({
-                "isCurrent": det.get("isCurrent", False),
-                "taxonId": det.get("taxonId", None),
-                "determinerID": det.get("determination", {}).get("determinerID", None),
-                "determinerName": det.get("determination", {}).get("determinerName", None),
-                "date": det.get("date", None),
-                "remarks": det.get("remarks", None)
-            })
+        determinations = _normalize_determinations(data.zDetermination)
+        preparations = _normalize_preparations(data.preparation)
 
-        # Convert preparation data to JSON
-        preparations = []
-        for prep in data.preparation:
-            preparations.append({
-                "preparationType": prep.get("preparationType", None),
-                "count": prep.get("count", None)
-            })
+        # 子节点路径:有 parentId → 建一条挂在父节点下的完整记录(生成 identifier,不分配 catalog)。
+        if data.parentId:
+            return await _create_sub_lot(data, determinations, preparations)
 
-        # Call the stored procedure
+        # root 路径:校验 collection(缺省 fluid),image 不能当 root。
+        collection = (data.collection or "fluid").lower()
+        if collection not in ROOT_COLLECTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"collection must be one of: {', '.join(sorted(ROOT_COLLECTIONS))} "
+                       f"(image is a voucher leaf and cannot be a root lot)",
+            )
+
         result = await execute_proc(
             "add_lot_procedure",
             data.scientificName,
@@ -682,19 +775,83 @@ async def new_lot(data: LotModel):
             data.catalogerId if data.catalogerId else None,
             data.totalNumber if data.totalNumber else None,
             determinations,
-            preparations
+            preparations,
+            collection
         )
+
+        # 一并回查 PrimaryID，前端建完 root 可直接载入其 collection 树（不必再按 catalog 反查）
+        row = await execute_query('SELECT "PrimaryID" FROM "Primary" WHERE "CatalogNumber" = $1', result)
+        primary_id = row[0]["PrimaryID"] if row else None
 
         return {
             "code": 20000,
             "data": {
-                "items": {"CatalogNumber": result},
+                "items": {"CatalogNumber": result, "PrimaryID": primary_id},
                 "total": 1
             }
         }
 
+    except HTTPException:
+        raise  # 让 400(collection 校验等)原样透出，别被下面吞成 500
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _create_sub_lot(data: "LotModel", determinations: list, preparations: list) -> dict:
+    """建一个完整的子节点记录(parent_id + identifier,不占 catalog 号)。
+    继承(taxon/locality)由前端预填后整体提交,后端只管存。
+    每个节点都是一条 Primary 记录,各自带 Determination + Preparation。同一事务。
+    """
+    coll = (data.collection or "").lower()
+    if coll not in SUB_LOT_COLLECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sub-record collection must be one of: {', '.join(sorted(SUB_LOT_COLLECTIONS))} "
+                   f"(image is handled separately)",
+        )
+    parent = await execute_query(
+        'SELECT "PrimaryID", collection FROM "Primary" WHERE "PrimaryID" = $1', data.parentId)
+    if not parent:
+        raise HTTPException(status_code=404, detail="parent record not found")
+    if (parent[0].get("collection") or "") == "image":
+        raise HTTPException(status_code=400, detail="image is a voucher leaf and cannot have sub-records")
+
+    ident = await _next_collection_identifier(COLLECTION_PREFIX[coll])
+    async with get_db() as conn:
+        async with conn.transaction():
+            # CatalogNumber 显式 NULL(子节点用 identifier);DateCataloged 列是 date,
+            # data.dateCataloged 是 datetime(date 的子类)asyncpg 可直接编码。
+            pid = await conn.fetchval(
+                'INSERT INTO "Primary" '
+                '(parent_id, collection, identifier, "CatalogNumber", "PrevNumber", "DateCataloged", '
+                ' "JarSize", "Storage", "TypeStatus", "Inventory", "Remarks", "Locality1ID", '
+                ' "CatalogerID", "TotalNumber") '
+                'VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING "PrimaryID"',
+                data.parentId, coll, ident,
+                # DateCataloged 列是 timestamp；前端带 Z(tz-aware),asyncpg 编码会和 naive 纪元相减报错。
+                # 去掉时区转 naive(只关心日期);root 走存储过程(date 参数)不受影响。
+                data.prevNumber,
+                data.dateCataloged.replace(tzinfo=None) if data.dateCataloged else None,
+                data.jarSize, data.storage, data.typeStatus, data.inventory, data.remarks,
+                data.localityId if data.localityId else None,
+                data.catalogerId if data.catalogerId else None,
+                data.totalNumber if data.totalNumber else None,
+            )
+            for det in determinations:
+                # Date1 来自原始 dict(字符串/None),用 ::text::date 兼容字符串日期。
+                await conn.execute(
+                    'INSERT INTO "Determination" '
+                    '("PrimaryID","IsCurrent","TaxonID","Determiner","DeterminerName","Date1","Remarks") '
+                    'VALUES ($1,$2,$3,$4,$5,$6::text::date,$7)',
+                    pid, det["isCurrent"], det["taxonId"], det["determinerID"],
+                    det["determinerName"], det["date"], det["remarks"],
+                )
+            for prep in preparations:
+                await conn.execute(
+                    'INSERT INTO "Preparation" ("PrimaryID","PreparationType","Count") VALUES ($1,$2,$3)',
+                    pid, prep["preparationType"], prep["count"],
+                )
+    return {"code": 20000, "data": {"items": {"PrimaryID": pid, "identifier": ident, "collection": coll}, "total": 1}}
 
 
 @router.put("/lot", response_model=ResponseModel)
@@ -855,3 +1012,51 @@ async def get_lot_tree(primary_id: int):
         primary_id,
     )
     return {"code": 20000, "data": {"items": rows, "total": len(rows)}}
+
+
+@router.delete("/sub-record/{primary_id}", response_model=ResponseModel)
+async def delete_sub_record(primary_id: int, cascade: bool = Query(False)):
+    """删除一个子记录节点（即存模式下的纠错入口）。
+    - 只能删子记录（parent_id 非空）；root lot 不走此接口（用 deaccession / 删 lot 流程）。
+    - 默认只删叶子；若节点有后代，需 cascade=true 才连整棵子树一起删（防误删整片）。
+    """
+    node = await execute_query(
+        'SELECT "PrimaryID", parent_id, collection, identifier FROM "Primary" WHERE "PrimaryID" = $1',
+        primary_id,
+    )
+    if not node:
+        raise HTTPException(status_code=404, detail="record not found")
+    if node[0]["parent_id"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="this is a root lot, not a sub-record; cannot delete via this endpoint",
+        )
+
+    # 收集子树（含自身）
+    descendants = await execute_query(
+        '''
+        WITH RECURSIVE tree AS (
+            SELECT "PrimaryID" FROM "Primary" WHERE "PrimaryID" = $1
+            UNION ALL
+            SELECT c."PrimaryID" FROM "Primary" c JOIN tree t ON c.parent_id = t."PrimaryID"
+        )
+        SELECT "PrimaryID" FROM tree
+        ''',
+        primary_id,
+    )
+    ids = [r["PrimaryID"] for r in descendants]
+    child_count = len(ids) - 1
+    if child_count > 0 and not cascade:
+        raise HTTPException(
+            status_code=400,
+            detail=f"node has {child_count} sub-record(s); pass cascade=true to delete the whole subtree",
+        )
+
+    # 一个事务里：先删依赖表（Determination/Preparation），再删 Primary（整棵子树一条 set 删除，
+    # parent_id 自引用 FK 为 NO ACTION，语句末统一校验，子树内引用同时消失，不违例）。
+    await execute_transaction([
+        {"sql": 'DELETE FROM "Determination" WHERE "PrimaryID" = ANY($1::int[])', "params": [ids]},
+        {"sql": 'DELETE FROM "Preparation" WHERE "PrimaryID" = ANY($1::int[])', "params": [ids]},
+        {"sql": 'DELETE FROM "Primary" WHERE "PrimaryID" = ANY($1::int[])', "params": [ids]},
+    ])
+    return {"code": 20000, "data": {"items": {"deleted_primary_ids": ids, "count": len(ids)}, "total": len(ids)}}
