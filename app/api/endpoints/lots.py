@@ -171,6 +171,7 @@ LOTS_SPEC = FilterSpec(
         f."FamilyID", f."FamilyName", f."FamilyNumber",
         l."FieldNo", l."LocalityString", l."Country", l."State", l."County",
         l."Drainage", l."WaterBody", l."Lat", l."Lon", l."StartDate", l."VerbatimDate",
+        l."VerbatimCollectors",
         vl."verbatim_locality_string", vl."verbatim_country", vl."verbatim_state",
         vl."verbatim_county", vl."verbatim_drainage", vl."verbatim_waterbody", vl."verbatim_fieldno",
         vtx."verbatim_family", vtx."verbatim_genus", vtx."verbatim_species",
@@ -383,18 +384,16 @@ async def get_lot_string(catid: int):
     Get lot string by catalog ID.
     Mirrors the original getLotString function.
     """
+    # 展平为直接 JOIN（避免旧版 tt1.* 暴露的 Primary.TaxonID 与 Determination.TaxonID 在子查询里重名歧义）；
+    # 用当前鉴定（IsCurrent）的 TaxonID 关联学名。
     query = """
-    SELECT tt2."PrimaryID" as "LotID", 
-           CONCAT(tt2."CatalogNumber", '(', tt2."TotalNumber", ') Pri = ', "TaxonomicTable"."FullScientificName", ':', tt2."JarSize") as "LotString",
-           tt2."TotalNumber" 
-    FROM (
-        SELECT "Determination"."TaxonID", tt1.* 
-        FROM (
-            SELECT * FROM "Primary" WHERE "Primary"."CatalogNumber" = $1
-        ) as tt1 
-        LEFT JOIN "Determination" ON tt1."PrimaryID" = "Determination"."PrimaryID" AND "Determination"."IsCurrent" = true
-    ) as tt2 
-    LEFT JOIN "TaxonomicTable" ON "TaxonomicTable"."TaxonID" = tt2."TaxonID"
+    SELECT p."PrimaryID" as "LotID",
+           CONCAT(p."CatalogNumber", '(', p."TotalNumber", ') Pri = ', tt."FullScientificName", ':', p."JarSize") as "LotString",
+           p."TotalNumber"
+    FROM "Primary" p
+    LEFT JOIN "Determination" d ON d."PrimaryID" = p."PrimaryID" AND d."IsCurrent" = true
+    LEFT JOIN "TaxonomicTable" tt ON tt."TaxonID" = d."TaxonID"
+    WHERE p."CatalogNumber" = $1
     """
 
     records = await execute_query(query, catid)

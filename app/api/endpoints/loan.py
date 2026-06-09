@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_single_query, \
     execute_paginated_query_with_count
 from app.services.es_sync import handle_data_change
+from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 
 router = APIRouter()
 
@@ -87,118 +88,153 @@ async def get_loan(loanid: str):
     }
 
 
+def _pdate(col: str) -> str:
+    """把混合格式的文本日期解析成 date：'YYYY-MM-DD[ ...]' / 'M/D/YYYY' / 'M/D/YY'，解析不了为 NULL。
+    loan_view 的 LoanDate/DateClosed 是 varying 且格式不统一（老数据），筛选/排序前需转换。"""
+    return (
+        "CASE "
+        f"WHEN trim({col}) ~ '^[0-9]{{4}}-[0-9]{{1,2}}-[0-9]{{1,2}}' THEN to_date(left(trim({col}),10),'YYYY-MM-DD') "
+        f"WHEN trim({col}) ~ '^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{4}}$' THEN to_date(trim({col}),'FMMM/FMDD/YYYY') "
+        f"WHEN trim({col}) ~ '^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{2}}$' THEN to_date(trim({col}),'FMMM/FMDD/YY') "
+        "ELSE NULL END"
+    )
+
+
+_LOAN_DATE_SQL = _pdate('lv."LoanDate"')
+_DATE_CLOSED_SQL = _pdate('lv."DateClosed"')
+
+# Loan 搜索字段注册表（复用 lots 的过滤引擎）。建在 loan_view 上，无需 join。
+# 结果 DISTINCT 到借阅级（一行 = 一个 loan）；用标本/产地/分类列筛选 → 命中的借阅。
+# 解析后的 LoanDateParsed/DateClosedParsed 放进 SELECT，才能在 DISTINCT 下按日期排序。
+LOAN_SPEC = FilterSpec(
+    base='loan_view lv',
+    joins='',
+    select=f'''
+        DISTINCT lv."ID", lv."LoanNumber", lv."TransactionType",
+        lv."LoanDate", lv."DateClosed", lv."Closed",
+        lv."FullName", lv."LastName", lv."OrganizationID", lv."AgentID",
+        lv."LoanAgents", lv."LoanPeopleID",
+        {_LOAN_DATE_SQL} AS "LoanDateParsed",
+        {_DATE_CLOSED_SQL} AS "DateClosedParsed"
+    ''',
+    order_by=f'{_LOAN_DATE_SQL} DESC NULLS LAST',
+    fields={
+        "loan_number":      FieldDef('lv."LoanNumber"', "text", "Loan #", "Loan"),
+        "transaction_type": FieldDef('lv."TransactionType"', "enum", "Transaction Type", "Loan", options=["Loan", "Gift"]),
+        "loan_person":      FieldDef('lv."FullName"', "text", "Loan Person", "Loan"),
+        "last_name":        FieldDef('lv."LastName"', "text", "Last Name", "Loan"),
+        "organization":     FieldDef('lv."OrganizationID"', "text", "Organization", "Loan"),
+        "closed":           FieldDef('lv."Closed"', "enum", "Closed?", "Loan", options=["true", "false"]),
+        "catalog_number":   FieldDef('lv."CatalogNumber"', "idlist", "Catalog No.", "Specimen"),
+        "jar_size":         FieldDef('lv."JarSize"', "enum", "Jar Size", "Specimen"),  # 前端经 optionLoaders 加载真实选项
+        "storage":          FieldDef('lv."Storage"', "text", "Storage", "Specimen"),
+        "total_number":     FieldDef('lv."TotalNumber"', "number", "Total Number", "Specimen"),
+        "scientific_name":  FieldDef('lv."FullScientificName"', "text", "Scientific Name", "Taxonomy"),
+        "family":           FieldDef('lv."FamilyName"', "text", "Family", "Taxonomy"),
+        "field_no":         FieldDef('lv."FieldNo"', "text", "Field No.", "Locality"),
+        "locality_string":  FieldDef('lv."LocalityString"', "text", "Locality String", "Locality"),
+        "state":            FieldDef('lv."LocalityState"', "text", "State", "Locality"),
+        "county":           FieldDef('lv."LocalityCounty"', "text", "County", "Locality"),
+        "drainage":         FieldDef('lv."Drainage"', "text", "Drainage", "Locality"),
+        "loan_date":        FieldDef(_LOAN_DATE_SQL, "date", "Loan Date", "Dates"),
+        "date_closed":      FieldDef(_DATE_CLOSED_SQL, "date", "Date Closed", "Dates"),
+        "date_cataloged":   FieldDef('lv."DateCataloged"', "date", "Date Cataloged", "Dates"),
+    },
+    global_search_cols=[
+        "loan_number", "scientific_name", "family", "catalog_number",
+        "locality_string", "last_name", "organization", "field_no",
+    ],
+)
+
+# 仅允许按「借阅级（在 SELECT DISTINCT 列表里的）」字段排序，否则 DISTINCT + ORDER BY 会报错。
+_LOAN_SORTABLE = {
+    "loan_number", "transaction_type", "loan_date", "date_closed",
+    "loan_person", "last_name", "organization", "closed",
+}
+
+
 @router.get("/loanAdvanced", response_model=ResponseModel)
 async def get_loan_advanced(
-        loanNumber: Optional[str] = None,
-        ids: Optional[str] = None,
-        localityId: Optional[str] = None,
-        taxonId: Optional[str] = None,
-        familyID: Optional[str] = None,
-        loanPplID: Optional[str] = None,
-        fieldNo: Optional[str] = None,
-        jarSize: Optional[str] = None,
-        storage: Optional[str] = None,
-        inventory: Optional[str] = None,
-        maxNumber: Optional[str] = None,
-        minNumber: Optional[str] = None,
-        loanOpenStartDate: Optional[str] = None,
-        loanOpenEndDate: Optional[str] = None,
-        loanClosedStartDate: Optional[str] = None,
-        loanClosedEndDate: Optional[str] = None,
-        catalogStartDate: Optional[str] = None,
-        catalogEndDate: Optional[str] = None,
+        search: Optional[str] = Query(None, description="全局模糊搜索"),
+        ids: Optional[str] = Query(None, description="Catalog number 列表，逗号分隔"),
+        field_filters: Optional[str] = Query(None, description='JSON: {api_name:[值/__EMPTY__/__NOT_EMPTY__]}'),
+        structured_filters: Optional[str] = Query(None, description='JSON: [{"field":..,"op":..,"values":[..]}]'),
+        sort_by: Optional[str] = Query(None, description="排序字段（借阅级白名单内）"),
+        sort_order: Optional[str] = Query(None, description="asc | desc"),
+        fuzzy_threshold: float = Query(0.4, ge=0.0, le=1.0),
         pagination: PaginationParams = Depends(),
 ):
-    """
-    Get loans with advanced filtering.
-    Mirrors the original getLoanAdvanced function.
-    """
-    sql = """
-    SELECT DISTINCT "ID", "FullName", "AgentID", "OrganizationID", "TransactionType", 
-           "LoanDate", "DateClosed", "LoanNumber" 
-    FROM loan_view lv 
-    WHERE (1=1)
-    """
+    """借阅高级搜索（复用 lots 过滤引擎；结果 DISTINCT 到借阅级）。
+    标本/产地/分类列做筛选（作用在 item 级行上）→ DISTINCT 后得到命中的借阅。"""
+    id_list = None
+    if ids:
+        id_list = []
+        for s in ids.split(','):
+            s = s.strip()
+            if s:
+                try:
+                    id_list.append(int(s))
+                except ValueError:
+                    pass
+        id_list = id_list or None
 
-    # Process query parameters
+    where_clauses = []
     params = []
-    param_index = 1
+    p = 1
 
-    # Process IDs if provided
-    if ids and ids != "":
-        id_list = [int(id_str) for id_str in ids.split(',') if id_str]
-        if id_list:
-            sql += f" AND (lv.\"CatalogNumber\" = ANY(${param_index}::int[]))"
-            params.append(id_list)
-            param_index += 1
+    search_param_pos = None  # 原始查询词在哪个 $n（build_global_search 的 p_q）；relevance 排序复用，不另占参数
+    if search and str(search).strip():
+        pos = p
+        g_where, _rank, g_params, p = build_global_search(LOAN_SPEC, search, fuzzy_threshold, p)
+        if g_where:
+            where_clauses.append(g_where)
+            params.extend(g_params)
+            search_param_pos = pos
 
-    # Add other filters
-    if loanNumber:
-        sql += f" AND (TRIM(lv.\"LoanNumber\") = '{loanNumber}')"
+    w2, p2 = build_where(
+        LOAN_SPEC,
+        ids=id_list,
+        field_filters=parse_json_param(field_filters),
+        structured_filters=parse_json_param(structured_filters),
+        start_param=p,
+    )
+    where_clauses.extend(w2)
+    params.extend(p2)
 
-    if loanPplID:
-        sql += f" AND (lv.\"LoanPeopleID\" = '{loanPplID}')"
+    # 相关性排序：有全局搜索时，loan# 匹配越精确排越前（exact>prefix>contains），其次按日期。
+    # 用 build_global_search 的 item 级 rank 在 DISTINCT 下不可行，故按 loan# (借阅级) 算 rel，可放进 SELECT。
+    rel_sql = ""
+    rel_order = ""
+    if search_param_pos is not None:
+        rp = search_param_pos  # 复用全局搜索的原始查询词参数（$rp），main 与 count 参数数一致
+        rel_sql = (
+            f', CASE WHEN lower(lv."LoanNumber") = lower(${rp}) THEN 3 '
+            f"WHEN lv.\"LoanNumber\" ILIKE ${rp} || '%' THEN 2 "
+            f"WHEN lv.\"LoanNumber\" ILIKE '%' || ${rp} || '%' THEN 1 ELSE 0 END AS \"_rel\""
+        )
+        rel_order = '"_rel" DESC, '
 
-    if loanOpenStartDate:
-        sql += f" AND (lv.\"LoanDate\" >= '{loanOpenStartDate}')"
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    explicit_order = LOAN_SPEC.order_clause(sort_by, sort_order) if sort_by in _LOAN_SORTABLE else None
+    order_by = explicit_order if explicit_order else (rel_order + f'{_LOAN_DATE_SQL} DESC NULLS LAST')
 
-    if loanOpenEndDate:
-        sql += f" AND (lv.\"LoanDate\" <= '{loanOpenEndDate}')"
+    main_query = f"SELECT {LOAN_SPEC.select}{rel_sql} FROM loan_view lv{where_sql} ORDER BY {order_by}"
+    # 借阅级计数：COUNT(DISTINCT loan ID)，否则 total 会按 item 行数多算
+    count_query = f'SELECT COUNT(DISTINCT lv."ID") FROM loan_view lv{where_sql}'
 
-    if loanClosedStartDate:
-        sql += f" AND (lv.\"DateClosed\" >= '{loanClosedStartDate}')"
-
-    if loanClosedEndDate:
-        sql += f" AND (lv.\"DateClosed\" <= '{loanClosedEndDate}')"
-
-    if jarSize:
-        sql += f" AND (lv.\"JarSize\" = '{jarSize}')"
-
-    if storage:
-        sql += f" AND (lv.\"Storage\" = '{storage}')"
-
-    if inventory:
-        sql += f" AND (lv.\"Inventory\" = '{inventory}')"
-
-    if maxNumber:
-        sql += f" AND (lv.\"TotalNumber\" <= {maxNumber})"
-
-    if minNumber:
-        sql += f" AND (lv.\"TotalNumber\" >= {minNumber})"
-
-    if localityId:
-        sql += f" AND (lv.\"Locality1ID\" = {localityId})"
-
-    if catalogStartDate:
-        sql += f" AND (lv.\"DateCataloged\" >= '{catalogStartDate}')"
-
-    if catalogEndDate:
-        sql += f" AND (lv.\"DateCataloged\" <= '{catalogEndDate}')"
-
-    if fieldNo:
-        sql += f" AND lv.\"FieldNo\" ~* '{fieldNo}'"
-
-    if taxonId:
-        sql += f" AND (lv.\"TaxonID\" = '{taxonId}')"
-
-    if familyID:
-        sql += f" AND (lv.\"FamilyID\" = '{familyID}')"
-
-    # 添加排序
-    sql += " ORDER BY \"LoanDate\" DESC"
-
-    # 构建计数查询
-    base_sql = sql.split(' ORDER BY ')[0]  # 去掉 ORDER BY 子句
-    count_sql = f"SELECT COUNT(*) FROM ({base_sql}) AS count_query"
-
-    # 使用您现有的函数执行分页查询和计数
     return await execute_paginated_query_with_count(
-        main_query=sql,
-        count_query=count_sql,
+        main_query=main_query,
+        count_query=count_query,
         params=params,
         page=pagination.page,
-        page_size=pagination.page_size
+        page_size=pagination.page_size,
     )
+
+
+@router.get("/filter-metadata", response_model=ResponseModel)
+async def get_loan_filter_metadata():
+    """返回 loan 可过滤列清单（key/label/group/type/operators），驱动前端 chip 选择器。"""
+    return {"code": 20000, "data": {"fields": LOAN_SPEC.to_metadata()}}
 
 @router.get("/loanpeople", response_model=ResponseModel)
 async def get_loan_people():

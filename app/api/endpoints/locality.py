@@ -1,13 +1,62 @@
 from datetime import datetime, date
 
+import os
+
+import httpx
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional, Union
 from pydantic import BaseModel
 
-from app.db.database import execute_query, execute_mutation
+from app.db.database import execute_query, execute_mutation, execute_paginated_query_with_count
 from app.services.es_sync import handle_data_change
+from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 
 router = APIRouter()
+
+
+class _Pagination:
+    def __init__(
+        self,
+        page: int = Query(1, ge=1, description="页码，从1开始"),
+        page_size: int = Query(20, ge=1, le=100, description="每页记录数")
+    ):
+        self.page = page
+        self.page_size = page_size
+
+
+# Locality 搜索字段注册表（复用 lots 的过滤引擎）。建在 locality1 上，一行一产地，无需 DISTINCT。
+# 策展人要的核心：locality_string 等 contains 子串搜索；外加 lat/lon 空值筛选找"待 geolocate"的产地。
+LOCALITY_SPEC = FilterSpec(
+    base='locality1 l',
+    joins='',
+    select='''
+        l."Locality1ID", l."FieldNo", l."LocalityString", l."Drainage", l."WaterBody",
+        l."Continent", l."Country", l."State", l."County", l."Island",
+        l."Lat", l."Lon", l."ElevationMethod",
+        l."StartDate", l."EndDate", l."VerbatimDate", l."VerbatimCollectors",
+        l."year", l."month", l."day", l."Inventory", l."TimeStampModified"
+    ''',
+    order_by='l."Locality1ID" DESC',
+    fields={
+        "field_no":         FieldDef('l."FieldNo"', "text", "Field No.", "Locality"),
+        "locality_string":  FieldDef('l."LocalityString"', "text", "Locality String", "Locality"),
+        "drainage":         FieldDef('l."Drainage"', "text", "Drainage", "Locality"),
+        "water_body":       FieldDef('l."WaterBody"', "text", "Water Body", "Locality"),
+        "continent":        FieldDef('l."Continent"', "text", "Continent", "Geography"),
+        "country":          FieldDef('l."Country"', "text", "Country", "Geography"),
+        "state":            FieldDef('l."State"', "text", "State", "Geography"),
+        "county":           FieldDef('l."County"', "text", "County", "Geography"),
+        "island":           FieldDef('l."Island"', "text", "Island", "Geography"),
+        "collectors":       FieldDef('l."VerbatimCollectors"', "text", "Collectors", "Collecting"),
+        "verbatim_date":    FieldDef('l."VerbatimDate"', "text", "Verbatim Date", "Collecting"),
+        "lat":              FieldDef('l."Lat"', "number", "Latitude", "Coordinates"),
+        "lon":              FieldDef('l."Lon"', "number", "Longitude", "Coordinates"),
+    },
+    global_search_cols=[
+        "field_no", "locality_string", "drainage", "water_body",
+        "continent", "country", "state", "county", "collectors",
+    ],
+)
 
 
 class LocalityModel(BaseModel):
@@ -219,33 +268,257 @@ async def get_locality_numbers_by_year(year: str):
 
 @router.get("/localityAdvanced", response_model=ResponseModel)
 async def get_locality_advanced(
-        fieldNo: Optional[str] = None,
-        limit: Optional[int] = 100
+        search: Optional[str] = Query(None, description="全局模糊搜索"),
+        field_filters: Optional[str] = Query(None, description='JSON: {api_name:[值/__EMPTY__/__NOT_EMPTY__]}'),
+        structured_filters: Optional[str] = Query(None, description='JSON: [{"field":..,"op":..,"values":[..]}]'),
+        sort_by: Optional[str] = Query(None),
+        sort_order: Optional[str] = Query(None),
+        fuzzy_threshold: float = Query(0.4, ge=0.0, le=1.0),
+        pagination: _Pagination = Depends(),
 ):
-    """
-    Get localities with advanced filtering.
-    Mirrors the original getLocalityAdvanced function.
-    """
-    if not fieldNo or fieldNo == "":
-        query = """
-        SELECT * FROM locality1 LIMIT $1
-        """
-        records = await execute_query(query, limit)
-    else:
-        query = """
-        SELECT * FROM locality1 l 
-        WHERE l."FieldNo" ~* $1
-        LIMIT $2
-        """
-        records = await execute_query(query, fieldNo, limit)
+    """Locality 高级搜索（复用 lots 过滤引擎）。一行一产地，无 DISTINCT，可直接用相关性排序。
+    策展人要的 locality_string contains、以及 lat/lon 空值筛选（找待 geolocate 的产地）都走它。"""
+    where_clauses = []
+    params = []
+    p = 1
+    rank_expr = None
 
-    return {
-        "code": 20000,
-        "data": {
-            "items": records,
-            "total": len(records)
-        }
-    }
+    if search and str(search).strip():
+        g_where, rank_expr, g_params, p = build_global_search(LOCALITY_SPEC, search, fuzzy_threshold, p)
+        if g_where:
+            where_clauses.append(g_where)
+            params.extend(g_params)
+
+    w2, p2 = build_where(
+        LOCALITY_SPEC,
+        field_filters=parse_json_param(field_filters),
+        structured_filters=parse_json_param(structured_filters),
+        start_param=p,
+    )
+    where_clauses.extend(w2)
+    params.extend(p2)
+
+    order_by = LOCALITY_SPEC.order_clause(sort_by, sort_order)
+    if not order_by and rank_expr:
+        order_by = rank_expr + ' DESC, l."Locality1ID" DESC'
+    main_query, count_query = LOCALITY_SPEC.build_queries(where_clauses, order_by=order_by)
+
+    return await execute_paginated_query_with_count(
+        main_query=main_query,
+        count_query=count_query,
+        params=params,
+        page=pagination.page,
+        page_size=pagination.page_size,
+    )
+
+
+@router.get("/filter-metadata", response_model=ResponseModel)
+async def get_locality_filter_metadata():
+    """返回 locality 可过滤列清单，驱动前端 chip 选择器。
+    用单段路径 /filter-metadata（不能放 /locality/ 下，否则被 /locality/{keyword} 抢；
+    且在 /{locality_id} 之前定义，先匹配）。"""
+    return {"code": 20000, "data": {"fields": LOCALITY_SPEC.to_metadata()}}
+
+
+# GEOLocate 公共地理参照服务（geo-locate.org）：按文字 locality + 行政区反查候选坐标。
+_GEOLOCATE_URL = "https://www.geo-locate.org/webservices/geolocatesvcv2/glcwrap.aspx"
+
+
+@router.get("/georeference", response_model=ResponseModel)
+async def georeference_locality(
+        locality: str = Query(..., description="locality 文字描述"),
+        country: Optional[str] = Query(None),
+        state: Optional[str] = Query(None),
+        county: Optional[str] = Query(None),
+        enable_h2o: bool = Query(True, description="水体定位（河流/湖泊，鱼类产地建议开）"),
+):
+    """代理 GEOLocate 公共服务，返回规整后的候选坐标列表（lat/lon/精度/score/不确定半径/解析模式）。
+    走后端代理避免前端跨域(CORS)。单段路径，避开 /locality/{keyword}。"""
+    if not locality or not locality.strip():
+        raise HTTPException(status_code=400, detail="locality is required")
+    params = {"locality": locality, "fmt": "json", "doUncert": "true"}
+    if country:
+        params["country"] = country
+    if state:
+        params["state"] = state
+    if county:
+        params["county"] = county
+    if enable_h2o:
+        params["enableH2O"] = "true"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(_GEOLOCATE_URL, params=params, headers={"User-Agent": "museum-tool/1.0"})
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GEOLocate request failed: {e}")
+
+    feats = (data.get("resultSet") or {}).get("features") or data.get("features") or []
+    candidates = []
+    for f in feats:
+        coords = ((f.get("geometry") or {}).get("coordinates") or []) + [None, None]
+        props = f.get("properties") or {}
+        candidates.append({
+            "lon": coords[0], "lat": coords[1],
+            "precision": props.get("precision"),
+            "score": props.get("score"),
+            "uncertaintyMeters": props.get("uncertaintyRadiusMeters"),
+            "parsePattern": props.get("parsePattern"),
+        })
+    return {"code": 20000, "data": {"items": candidates, "total": len(candidates)}}
+
+
+class CoordsUpdateModel(BaseModel):
+    localityId: int
+    lat: float
+    lon: float
+
+
+@router.post("/update-coords", response_model=ResponseModel)
+async def update_locality_coords(data: CoordsUpdateModel):
+    """把（georeference 选定的）经纬度存回某条 locality。"""
+    await execute_mutation(
+        'UPDATE locality1 SET "Lat" = $1, "Lon" = $2, "TimeStampModified" = NOW() WHERE "Locality1ID" = $3',
+        data.lat, data.lon, data.localityId,
+    )
+    return {"code": 20000, "data": {"items": {"Locality1ID": data.localityId, "Lat": data.lat, "Lon": data.lon}, "total": 1}}
+
+
+class LocalityUpdateModel(BaseModel):
+    localityId: int
+    # 字段名对齐 localityform 的 form（编辑复用 add 表单）
+    fieldNo: Optional[str] = None
+    localityString: Optional[str] = None
+    drainage: Optional[str] = None
+    waterbody: Optional[str] = None
+    country: Optional[str] = None
+    continent: Optional[str] = None
+    state: Optional[str] = None
+    county: Optional[str] = None
+    latitude: Optional[Union[str, float]] = None
+    longitude: Optional[Union[str, float]] = None
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+    verbatimDate: Optional[str] = None
+    remark: Optional[str] = None
+    inventory: Optional[str] = None
+    verbatimCollectors: Optional[str] = None
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.post("/update-locality", response_model=ResponseModel)
+async def update_locality(data: LocalityUpdateModel):
+    """更新一条已有 locality（编辑复用 add 表单，按 Locality1ID 改）。
+    StartDate/EndDate 是 timestamp（前端可能传带 Z 的字符串），用 NULLIF::timestamp 兼容；Lat/Lon 字符串转 float。"""
+    await execute_mutation(
+        '''
+        UPDATE locality1 SET
+            "FieldNo" = $2, "LocalityString" = $3, "Drainage" = $4, "WaterBody" = $5,
+            "Country" = $6, "Continent" = $7, "State" = $8, "County" = $9,
+            "Lat" = $10, "Lon" = $11,
+            "StartDate" = NULLIF($12, '')::timestamp, "EndDate" = NULLIF($13, '')::timestamp,
+            "VerbatimDate" = $14, "Remarks" = $15, "Inventory" = $16, "VerbatimCollectors" = $17,
+            "TimeStampModified" = NOW()
+        WHERE "Locality1ID" = $1
+        ''',
+        data.localityId, data.fieldNo, data.localityString, data.drainage, data.waterbody,
+        data.country, data.continent, data.state, data.county,
+        _to_float(data.latitude), _to_float(data.longitude),
+        data.startDate or '', data.endDate or '',
+        data.verbatimDate, data.remark, data.inventory, data.verbatimCollectors,
+    )
+    return {"code": 20000, "data": {"items": {"Locality1ID": data.localityId}, "total": 1}}
+
+
+# ---- 地理位置建议（gazetteer）：本地受控词表 + GeoNames 全球库 ----
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME", "tubrimap")
+# 本地表（扁平，只名字）：level -> (表, 列)
+_LOCAL_GEO = {
+    "continent": ('"Continents"', '"Continent"'),
+    "country": ('"Countries"', '"Country"'),
+    "state": ('"States"', '"State"'),
+    "county": ('"Counties"', '"County"'),
+}
+# GeoNames featureCode：按行政层级筛
+_GEONAMES_FC = {"continent": "CONT", "country": "PCLI", "state": "ADM1", "county": "ADM2"}
+
+
+async def _local_geo_suggest(level: str, q: str, limit: int):
+    t = _LOCAL_GEO.get(level)
+    if not t:
+        return []
+    table, col = t
+    if q:
+        rows = await execute_query(
+            f'SELECT {col} AS name FROM {table} WHERE {col} ILIKE $1 ORDER BY {col} LIMIT {limit}', f"%{q}%")
+    else:
+        rows = await execute_query(f'SELECT {col} AS name FROM {table} ORDER BY {col} LIMIT {limit}')
+    return [{"name": r["name"], "source": "local"} for r in rows if r["name"]]
+
+
+async def _geonames_suggest(level: str, q: str, limit: int):
+    """GeoNames 全球库（带行政层级 + 坐标）。失败/未启用 web services → 返回 []（优雅降级）。"""
+    if not q:
+        return []
+    params = {"q": q, "maxRows": limit, "username": GEONAMES_USERNAME, "style": "MEDIUM", "orderby": "relevance"}
+    fc = _GEONAMES_FC.get(level)
+    if fc:
+        params["featureCode"] = fc
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.get("http://api.geonames.org/searchJSON", params=params,
+                                    headers={"User-Agent": "museum-tool/1.0"})
+            data = resp.json()
+    except Exception:
+        return []
+    if not isinstance(data, dict) or data.get("status"):
+        return []  # status 错误对象（如账号未启用 web services）
+    out = []
+    for g in data.get("geonames", []):
+        out.append({
+            "name": g.get("name"),
+            "country": g.get("countryName"),
+            "countryCode": g.get("countryCode"),
+            "state": g.get("adminName1"),
+            "county": g.get("adminName2"),
+            "lat": g.get("lat"),
+            "lng": g.get("lng"),
+            "source": "geonames",
+        })
+    return out
+
+
+@router.get("/geo-suggest", response_model=ResponseModel)
+async def geo_suggest(
+        q: str = Query("", description="输入片段"),
+        level: str = Query("country", description="continent|country|state|county"),
+        limit: int = Query(8, ge=1, le=20),
+):
+    """地名建议：先本地受控词表（快、可控），再 GeoNames（全球 + 官方名 + 层级 + 坐标）。
+    单段路径，避开 /locality/{keyword} 与 /{locality_id}。"""
+    ql = (q or "").strip()
+    local = await _local_geo_suggest(level, ql, limit)
+    geo = await _geonames_suggest(level, ql, limit)
+    seen = set()
+    items = []
+    # 去重按 (name + 层级)：GeoNames 的同名不同地（Hancock/Ohio vs Hancock/Mississippi）要都保留，
+    # 否则会被同名的本地条目折叠掉，丢了层级这个最大价值。
+    for s in local + geo:
+        nm = (s.get("name") or "").strip().lower()
+        if not nm:
+            continue
+        key = (nm, (s.get("state") or "").strip().lower(), (s.get("country") or "").strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(s)
+    return {"code": 20000, "data": {"items": items, "total": len(items)}}
 
 
 @router.get("/country", response_model=ResponseModel)
