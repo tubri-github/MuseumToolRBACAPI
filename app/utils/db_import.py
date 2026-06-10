@@ -532,17 +532,19 @@ class DatabaseUtils:
             fully_verified = check_result[0]['fully_verified_records']
             already_migrated = check_result[0]['already_migrated']
 
-            if already_migrated > 0:
-                raise Exception(f"Batch {batch_serial_id} has already been migrated ({already_migrated} records)")
+            # 部分迁移（curator 批准 2026-06-10）：只迁 overall='completed' 且未迁移的记录；
+            # 未完成（如缺 taxon 匹配）的 pending 留在 primary_temp，下次 batch complete 再补迁。
+            # 因此不因 pending 整批拒绝，也不因「已迁过一部分」整批拒绝（支持分次迁移）。
+            unmigrated_completed = fully_verified - already_migrated  # 本次可迁：completed 且未迁
+            if unmigrated_completed <= 0:
+                raise Exception(f"Cannot migrate batch {batch_serial_id}. No newly-completed records to migrate (completed={fully_verified}, already_migrated={already_migrated}, total={total}).")
 
-            # 检查是否所有记录都完成验证（overall_verification_status = 'completed'）
-            if fully_verified < total:
-                raise Exception(f"Cannot migrate batch {batch_serial_id}. Only {fully_verified}/{total} records have overall_verification_status = 'completed'. All records must be fully verified before migration.")
-
-            # 2. 获取所有待迁移的记录
+            # 2. 获取待迁移记录（仅 overall='completed' 且未迁移，跳过 pending）
             fetch_temp_records_query = """
             SELECT * FROM primary_temp
-            WHERE batch_serial_id = $1 AND final_primary_id IS NULL
+            WHERE batch_serial_id = $1
+              AND final_primary_id IS NULL
+              AND overall_verification_status = 'completed'
             ORDER BY "PrimaryID"
             """
 
@@ -566,9 +568,9 @@ class DatabaseUtils:
                     "JarSize", "PrevNumber", "Inventory", "Remarks", "match_type",
                     "review_flag", "batch_serial_id", "species_verification_status",
                     "locality_verification_status", "record_verification_status",
-                    "TimeStampModified", "DateCataloged"
+                    "CatalogerID", "TimeStampModified", "DateCataloged"
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW()
                 ) RETURNING "PrimaryID"
             """
 
@@ -583,13 +585,32 @@ class DatabaseUtils:
                         temp_id = temp_record['PrimaryID']
                         temp_id_to_catalog[temp_id] = catalog_number
 
+                        # 新设计：batch complete 时为【每条记录】新建一个 locality1（一条记录=一个 locality），
+                        # 用其 verbatim 产地填充。FieldNo 留空（UNIQUE 约束，且日后由 curator 补）、
+                        # 坐标留默认（日后 georeference）。去重/减量是日后 curator 的事，不再依赖 locality 匹配/验证。
+                        new_locality_id = temp_record.get('Locality1ID')
+                        v_loc_id = temp_record.get('verbatim_localityid')
+                        if v_loc_id is not None:
+                            new_locality_id = await conn.fetchval(
+                                '''
+                                INSERT INTO locality1 ("LocalityString","Drainage","Country","State","County",
+                                                       "WaterBody","VerbatimDate","VerbatimCollectors","TimeStampModified")
+                                SELECT vl.verbatim_locality_string, vl.verbatim_drainage, vl.verbatim_country,
+                                       vl.verbatim_state, vl.verbatim_county, vl.verbatim_waterbody,
+                                       vl.verbatim_collect_date, vl.verbatim_collector, NOW()
+                                FROM verbatim_locality vl WHERE vl.verbatim_localityid = $1
+                                RETURNING "Locality1ID"
+                                ''',
+                                v_loc_id,
+                            )
+
                         primary_id = await conn.fetchval(
                             insert_primary_sql,
                             catalog_number,
                             temp_record.get('verbatim_taxonid'),
                             temp_record.get('verbatim_localityid'),
                             temp_record.get('TaxonID'),
-                            temp_record.get('Locality1ID'),
+                            new_locality_id,
                             temp_record.get('TotalNumber', 1),
                             temp_record.get('Storage'),
                             temp_record.get('JarSize'),
@@ -602,20 +623,36 @@ class DatabaseUtils:
                             temp_record.get('species_verification_status'),
                             temp_record.get('locality_verification_status'),
                             temp_record.get('record_verification_status'),
+                            # 显式带 CatalogerID（未归属时为 NULL，FK 允许）；不靠会撞 Staff FK 的默认值 0
+                            temp_record.get('CatalogerID'),
                         )
                         primary_id_map[temp_id] = primary_id
 
-                        # 5. 回填 primary_temp 映射关系
+                        # 5. 回填 primary_temp 映射关系（含新建的 Locality1ID）
                         await conn.execute(
                             '''
                             UPDATE primary_temp
                             SET final_catalog_number = $1,
                                 final_primary_id = $2,
+                                "Locality1ID" = $3,
                                 "TimeStampModified" = NOW()
-                            WHERE "PrimaryID" = $3
+                            WHERE "PrimaryID" = $4
                             ''',
-                            catalog_number, primary_id, temp_id,
+                            catalog_number, primary_id, new_locality_id, temp_id,
                         )
+
+                        # 5.5 建当前鉴定 Determination。lots/搜索是经 Determination(IsCurrent)
+                        #     连 taxon 名的（不是 Primary.TaxonID），不建则迁移后 lots 看不到分类名。
+                        #     Determiner 等未知留空；FK 要求 TaxonID 有效，故仅在非空时插。
+                        det_taxon_id = temp_record.get('TaxonID')
+                        if det_taxon_id is not None:
+                            await conn.execute(
+                                '''
+                                INSERT INTO "Determination" ("PrimaryID", "TaxonID", "IsCurrent")
+                                VALUES ($1, $2, true)
+                                ''',
+                                primary_id, det_taxon_id,
+                            )
 
                     # 6. 迁移 preparation_temp 记录（同一事务）
                     prep_temp_records = await conn.fetch(
@@ -655,6 +692,8 @@ class DatabaseUtils:
             return {
                 "batch_serial_id": batch_serial_id,
                 "migrated_count": len(temp_records),
+                "skipped_count": total - fully_verified,  # 未完成、留待下次 batch 的 pending 数
+                "total_count": total,
                 "preparation_migrated_count": len(prep_temp_records) if prep_temp_records else 0,
                 "catalog_number_range": {
                     "start": base + 1,

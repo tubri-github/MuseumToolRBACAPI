@@ -485,7 +485,16 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
             # 1. 验证 species name (exact match 自动验证)
             if record["species_match_status"] == "exact":
                 species_status = "verified"
-                print(f"Record {primary_id}: Species verified (exact match)")
+                # 同时把匹配到的 taxon 回填到 TaxonID（仿照下面 locality 分支写 Locality1ID）。
+                # 之前这里只置 verified、没写 TaxonID，导致 exact 自动验证的记录 TaxonID 为 NULL，
+                # 卡在迁移的 TaxonID-NOT-NULL 门槛上。
+                matched_taxon_id = record.get("matched_taxon_id")
+                if matched_taxon_id is not None:
+                    update_statements.append({
+                        "sql": 'UPDATE primary_temp SET "TaxonID" = $1 WHERE "PrimaryID" = $2',
+                        "params": [matched_taxon_id, primary_id]
+                    })
+                print(f"Record {primary_id}: Species verified (exact match), TaxonID={matched_taxon_id}")
             else:
                 print(f"Record {primary_id}: Species pending (match_status: {record['species_match_status']})")
 
@@ -1491,10 +1500,16 @@ async def confirm_batch_import(request: ConfirmBatchImportModel):
         # 调用迁移函数
         result = await db_utils.migrate_batch_from_temp_to_primary(batch_serial_id)
 
+        # 部分迁移：迁了 migrated_count 条，skipped_count 条 pending 留待下次 batch
         return ResponseModel(
             code=20000,
             data=result,
-            message=f"Successfully migrated batch {batch_serial_id}. Generated catalog numbers: {result['catalog_number_range']['start']}-{result['catalog_number_range']['end']}"
+            message=(
+                f"Migrated {result['migrated_count']} records "
+                f"(catalog {result['catalog_number_range']['start']}-{result['catalog_number_range']['end']}). "
+                f"Skipped {result['skipped_count']} pending record(s) — they stay in this batch and will be "
+                f"migrated in a future batch-complete once verified."
+            )
         )
 
     except Exception as e:
@@ -1543,7 +1558,8 @@ async def get_batch_verification_summary(batch_serial_id: str):
             SUM(CASE WHEN p."record_verification_status" = 'verified' THEN 1 ELSE 0 END) as record_verified,
             SUM(CASE WHEN COALESCE(p."species_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_taxonomic,
             SUM(CASE WHEN COALESCE(p."locality_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_locality,
-            SUM(CASE WHEN COALESCE(p."record_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_record
+            SUM(CASE WHEN COALESCE(p."record_verification_status", 'pending') = 'pending' THEN 1 ELSE 0 END) as pending_record,
+            SUM(CASE WHEN p.final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as cataloged
         FROM primary_temp p
         JOIN warning_analysis wa ON p."PrimaryID" = wa."PrimaryID"
         WHERE p.batch_serial_id = $1
@@ -1567,6 +1583,11 @@ async def get_batch_verification_summary(batch_serial_id: str):
                 "fully_verified": {
                     "count": stats["fully_verified"],
                     "percentage": round((stats["fully_verified"] / total * 100), 1) if total > 0 else 0
+                },
+                "cataloged": {
+                    "count": stats["cataloged"],
+                    "remaining": stats["fully_verified"] - stats["cataloged"],
+                    "percentage": round((stats["cataloged"] / stats["fully_verified"] * 100), 1) if stats["fully_verified"] > 0 else 0
                 },
                 "has_errors": {
                     "count": stats["has_errors"],

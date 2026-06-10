@@ -302,7 +302,8 @@ async def get_batch_info(batch_serial_id: str):
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
             SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
             SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
-            SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records
+            SUM(CASE WHEN review_flag = false THEN 1 ELSE 0 END) as reviewed_records,
+            SUM(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as cataloged_records
         FROM primary_temp
         WHERE batch_serial_id = $1
         GROUP BY batch_serial_id
@@ -322,6 +323,7 @@ async def get_batch_info(batch_serial_id: str):
         locality_processed = batch["locality_processed"]
         fully_processed = batch["fully_processed"]
         reviewed_records = batch["reviewed_records"]
+        cataloged_records = batch["cataloged_records"]  # 已迁移到 Primary（拿到正式 catalog number）的数量
 
         # Calculate completion percentages
         taxonomic_percent = round((taxonomic_processed / total) * 100, 1) if total > 0 else 0
@@ -378,6 +380,12 @@ async def get_batch_info(batch_serial_id: str):
                     "processed": fully_processed,
                     "total": total,
                     "percent": overall_percent
+                },
+                "cataloged": {
+                    "processed": cataloged_records,
+                    "total": fully_processed,  # catalog 目标 = 已完成验证(completed)数；pending 不计入
+                    "remaining": fully_processed - cataloged_records,
+                    "percent": round((cataloged_records / fully_processed) * 100, 1) if fully_processed > 0 else 0
                 }
             },
             "status": "completed" if overall_percent == 100 else "in_progress"
@@ -646,8 +654,7 @@ async def get_batch_records(
                         "waterbody": record["verbatim_waterbody"],
                         "latitude": record["verbatim_lat"],
                         "longitude": record["verbatim_lon"],
-                        "collect_date": record["verbatim_collect_date"].isoformat() if record[
-                            "verbatim_collect_date"] else None,
+                        "collect_date": record["verbatim_collect_date"],
                         "collector": record["verbatim_collector"]
                     }
                 },
@@ -662,8 +669,7 @@ async def get_batch_records(
                         "id": record["Locality1ID"],
                         "locality": record["matched_locality"],
                         "field_number": record["matched_field_number"],
-                        "collection_date": record["verbatim_collect_date"].isoformat() if record[
-                            "verbatim_collect_date"] else None
+                        "collection_date": record["verbatim_collect_date"]
                     }
                 },
                 "match_suggestions": {
@@ -998,7 +1004,7 @@ async def get_verbatim_locality(verbatim_locality_id: int):
             "verbatim_waterbody": result[0]["verbatim_waterbody"],
             "verbatim_lat": result[0]["verbatim_lat"],
             "verbatim_lon": result[0]["verbatim_lon"],
-            "verbatim_collect_date": result[0]["verbatim_collect_date"].isoformat() if result[0]["verbatim_collect_date"] else None,
+            "verbatim_collect_date": result[0]["verbatim_collect_date"],
             "verbatim_collector": result[0]["verbatim_collector"],
             "verbatim_fieldno": result[0]["verbatim_fieldno"],  # 对应 field_number
             "original_text": result[0]["original_text"]
@@ -1928,19 +1934,16 @@ async def mark_batch_completed(batch_serial_id: str):
         #         message=f"Cannot mark batch as completed. {incomplete_count} records are still missing TaxonID or Locality1ID."
         #     )
 
-        # Check if all records are verified (overall_verification_status = 'completed')
+        # 部分完成（curator 批准 2026-06-10）：不因 pending 整批拒绝。只把已完成
+        # （overall='completed'）的记录标记为无需 review；pending 的留着下次 batch 处理。
         not_verified_count = check_result[0]["not_verified"]
-        if not_verified_count > 0:
-            return ResponseModel(
-                code=40000,
-                message=f"Cannot mark batch as completed. {not_verified_count} records have not been fully verified (overall_verification_status != 'completed')."
-            )
 
-        # Mark all records in the batch as not needing review
+        # Mark only the fully-verified records as not needing review
         update_query = """
         UPDATE primary_temp
         SET "review_flag" = false, "TimeStampModified" = $1
         WHERE batch_serial_id = $2
+          AND overall_verification_status = 'completed'
         RETURNING "PrimaryID"
         """
 
@@ -1970,7 +1973,9 @@ async def mark_batch_completed(batch_serial_id: str):
             code=20000,
             data={
                 "batch_serial_id": batch_serial_id,
-                "message": f"Batch marked as completed with {len(update_result)} records",
+                "completed_count": len(update_result),
+                "pending_skipped_count": not_verified_count,
+                "message": f"Marked {len(update_result)} completed record(s); {not_verified_count} pending left for a future batch",
                 "completed_at": datetime.now().isoformat()
             }
         )
@@ -2083,6 +2088,8 @@ async def export_batch_results(batch_serial_id: str):
         SELECT
             p."PrimaryID",
             p."CatalogNumber",
+            p."final_catalog_number",
+            p."final_primary_id",
             p."verbatim_taxonid",
             p."verbatim_localityid",
             p."TaxonID",
@@ -2143,14 +2150,19 @@ async def export_batch_results(batch_serial_id: str):
         # Create a pandas DataFrame from the results
         df = pd.DataFrame(result)
 
-        # Format dates
+        # Format dates. NOTE: TimeStampModified is a real timestamp, but
+        # verbatim_collection_date is a free-text varchar (may already be a string
+        # like "1986-04-15" or verbatim "SUMMER 1983"), so only call isoformat on
+        # actual datetime objects and pass strings through unchanged.
         date_columns = ["verbatim_collection_date", "TimeStampModified"]
         for col in date_columns:
             if col in df.columns:
-                df[col] = df[col].apply(lambda x: x.isoformat() if x else None)
+                df[col] = df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else (x if x else None))
 
         # Reorder and rename columns for better readability - updated to include field_number columns
         column_mapping = {
+            "PrimaryID": "PrimaryID",
+            "final_catalog_number": "Official Catalog Number",
             "CatalogNumber": "Catalog Number",
             "matched_family": "Family",
             "matched_genus": "Genus",
