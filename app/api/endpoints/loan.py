@@ -2,7 +2,7 @@ from datetime import datetime, date
 
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_single_query, \
     execute_paginated_query_with_count
@@ -23,6 +23,11 @@ class LoanItemModel(BaseModel):
     OutComments: Optional[str] = None
     Remarks: Optional[str] = None
 
+    # frontend sends "" for blank quantity inputs -> coerce to None
+    @validator("Quantity", "QuantityReturned", "QuantityResolved", pre=True)
+    def _blank_qty_to_none(cls, v):
+        return None if v in ("", None) else v
+
 
 class LoanModel(BaseModel):
     loanId: Optional[int] = None
@@ -31,7 +36,7 @@ class LoanModel(BaseModel):
     transactionType: str
     loanDate: Optional[date] = None
     closed: bool = False
-    dateClosed: Optional[datetime] = None
+    dateClosed: Optional[date] = None   # proc p_dateclosed is DATE, not datetime
     text1: Optional[str] = None
     text2: Optional[str] = None
     loanPplID: Optional[int] = None
@@ -48,6 +53,34 @@ class LoanModel(BaseModel):
     loanDetails: List[LoanItemModel]
     updatedLoanDetails: Optional[List[LoanItemModel]] = []
     deletedLoanDetails: Optional[List[LoanItemModel]] = []
+
+    # frontend sends "" for empty optionals -> coerce to None for int fields
+    @validator("loanId", "loanPplID", pre=True)
+    def _blank_int_to_none(cls, v):
+        return None if v in ("", None) else v
+
+    # closed may arrive as "YES"/"NO"/"" — blank means not closed
+    @validator("closed", pre=True)
+    def _blank_closed_to_false(cls, v):
+        return False if v in ("", None) else v
+
+    # frontend sends full ISO datetime (e.g. 2026-06-16T17:10:28.198Z); proc wants DATE
+    @validator("loanDate", "dateClosed", pre=True)
+    def _parse_to_date(cls, v):
+        if v in ("", None):
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, str):
+            s = v.strip().replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(s).date()
+            except ValueError:
+                try:
+                    return date.fromisoformat(v.strip()[:10])
+                except ValueError:
+                    return v
+        return v
 
 
 class ResponseModel(BaseModel):
