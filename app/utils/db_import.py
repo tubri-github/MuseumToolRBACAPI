@@ -302,9 +302,10 @@ class DatabaseUtils:
                 "CatalogNumber", "verbatim_taxonid", "verbatim_localityid",
                 "TotalNumber", "Storage", "JarSize", "PrevNumber",
                 "Inventory", "Remarks", "match_type", "review_flag",
-                "batch_serial_id", "verification_warnings", "TimeStampModified", "DateCataloged"
+                "batch_serial_id", "verification_warnings", "source_primary_id",
+                "TypeStatus", "TimeStampModified", "DateCataloged"
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW()
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW()
             ) RETURNING "PrimaryID"
             """
 
@@ -321,7 +322,9 @@ class DatabaseUtils:
                 record.get("match_type", "no_match"),
                 record.get("review_flag", True),
                 batch_serial_id,
-                warnings_json
+                warnings_json,
+                record.get("source_primary_id"),
+                record.get("type_status")
             ]
 
             statements.append({

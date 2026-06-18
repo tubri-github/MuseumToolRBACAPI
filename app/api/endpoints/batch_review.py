@@ -12,6 +12,10 @@ from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation, execute_transaction
 from app.services.es_sync import handle_data_change
+from app.services.taxon_reference_check import (
+    family_reference_warning, family_suggestion_warning, store_warnings,
+    apply_family_checks,
+)
 from app.utils.validation import ImportValidationUtils
 from app.utils.species_validation import SpeciesNameValidator
 router = APIRouter()
@@ -19,6 +23,13 @@ router = APIRouter()
 
 class ApplyFamilyTaxonModel(BaseModel):
     family_id: int
+
+
+class CreateCofTaxonModel(BaseModel):
+    genus: str
+    species: str
+    subspecies: Optional[str] = None
+    family: Optional[str] = None
 
 # Pydantic models
 class ResponseModel(BaseModel):
@@ -134,6 +145,8 @@ class PrimaryRecordUpdateModel(BaseModel):
     jar_size: Optional[str] = None
     prev_number: Optional[str] = None
     inventory: Optional[str] = None
+    type_status: Optional[str] = None
+    collector_name: Optional[str] = None
     remarks: Optional[str] = None
     review_flag: Optional[bool] = None
 
@@ -331,13 +344,18 @@ async def get_batch_info(batch_serial_id: str):
         overall_percent = round((fully_processed / total) * 100, 1) if total > 0 else 0
         review_percent = round((reviewed_records / total) * 100, 1) if total > 0 else 0
 
-        # Get additional batch metadata from system logs if available
+        # Get additional batch metadata from system logs if available.
+        # NOTE: log_import_activity stores action_details as json.dumps(...) into a JSONB
+        # column, so it lands as a JSONB *string scalar* (double-encoded). Extract the
+        # scalar text via #>>'{}' then re-cast to jsonb so ->> works. Prefer the 'completed'
+        # log (it carries fieldMappings / fileName). Python side double-decodes too.
         log_query = """
-        SELECT action_details 
-        FROM system_logs 
-        WHERE action_type = 'batch_import' 
-        AND action_details::jsonb->>'batchSerialId' = $1
-        ORDER BY created_at DESC 
+        SELECT action_details
+        FROM system_logs
+        WHERE action_type = 'batch_import'
+          AND (action_details #>> '{}')::jsonb ->> 'batchSerialId' = $1
+          AND (action_details #>> '{}')::jsonb ->> 'status' = 'completed'
+        ORDER BY created_at DESC
         LIMIT 1
         """
 
@@ -346,20 +364,41 @@ async def get_batch_info(batch_serial_id: str):
         metadata = {}
         if log_result:
             try:
-                log_data = json.loads(log_result[0]["action_details"])
+                raw = log_result[0]["action_details"]
+                log_data = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(log_data, str):  # double-encoded jsonb string scalar
+                    log_data = json.loads(log_data)
                 metadata = {
                     "file_name": log_data.get("fileName", "Unknown"),
                     "import_mode": log_data.get("importMode", "Unknown"),
-                    "start_time": log_data.get("startTime")
+                    "start_time": log_data.get("startTime"),
+                    "field_mappings": log_data.get("fieldMappings")
                 }
-            except:
+            except Exception:
                 pass
+
+        # Retained source upload file (if any) for this batch
+        source_file = None
+        try:
+            sf = await execute_query(
+                "SELECT file_name, row_count, uploaded_at FROM batch_source_file "
+                "WHERE batch_serial_id = $1", batch_serial_id)
+            if sf:
+                source_file = {
+                    "file_name": sf[0]["file_name"],
+                    "row_count": sf[0]["row_count"],
+                    "uploaded_at": sf[0]["uploaded_at"].isoformat() if sf[0]["uploaded_at"] else None,
+                    "download_url": f"/api/batch/batches/{batch_serial_id}/source-file",
+                }
+        except Exception:
+            source_file = None  # table may not exist yet; non-fatal
 
         batch_info = {
             "batch_serial_id": batch["batch_serial_id"],
             "import_date": batch["import_date"].isoformat() if batch["import_date"] else None,
             "total_records": total,
             "metadata": metadata,
+            "source_file": source_file,
             "progress": {
                 "taxonomic": {
                     "processed": taxonomic_processed,
@@ -402,6 +441,23 @@ async def get_batch_info(batch_serial_id: str):
         )
 
 
+@router.get("/batches/{batch_serial_id}/source-file")
+async def download_batch_source_file(batch_serial_id: str):
+    """Download the original uploaded source file retained for this batch."""
+    try:
+        row = await execute_query(
+            "SELECT file_name, stored_path FROM batch_source_file WHERE batch_serial_id = $1",
+            batch_serial_id)
+        if not row:
+            return ResponseModel(code=40400, message="No source file recorded for this batch")
+        stored_path = row[0]["stored_path"]
+        if not stored_path or not os.path.exists(stored_path):
+            return ResponseModel(code=40400, message="Source file is missing on the server")
+        return FileResponse(stored_path, filename=row[0]["file_name"])
+    except Exception as e:
+        return ResponseModel(code=50000, message=f"Failed to download source file: {str(e)}")
+
+
 @router.get("/batches/{batch_serial_id}/records", response_model=ResponseModel)
 async def get_batch_records(
         batch_serial_id: str,
@@ -427,6 +483,7 @@ async def get_batch_records(
             p."JarSize",
             p."PrevNumber",
             p."Inventory",
+            p."TypeStatus",
             p."Remarks",
             p."TimeStampModified",
             p."review_flag",
@@ -683,6 +740,8 @@ async def get_batch_records(
                             "species": record["suggested_species"],
                         } if record["suggested_genus"] or record["suggested_species"] else None,
                         "match_details": match_details,
+                        # CoF accepted 名本地缺失时附带的「建议创建」(genus/species/family)
+                        "cof_create": (match_details or {}).get("cof_create") if isinstance(match_details, dict) else None,
                         "has_suggestion": record["matched_taxon_id"] is not None,
                         "suggestion_applied": record["TaxonID"] == record["matched_taxon_id"] if record[
                             "matched_taxon_id"] else False,
@@ -705,6 +764,7 @@ async def get_batch_records(
                     "jar_size": record["JarSize"],
                     "prev_number": record["PrevNumber"],
                     "inventory": record["Inventory"],
+                    "type_status": record["TypeStatus"],
                     "remarks": record["Remarks"],
                     "last_modified": record["TimeStampModified"].isoformat() if record["TimeStampModified"] else None,
                     "match_type": record["match_type"]
@@ -1494,6 +1554,7 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
             "jar_size": "JarSize",
             "prev_number": "PrevNumber",
             "inventory": "Inventory",
+            "type_status": "TypeStatus",
             "remarks": "Remarks",
             "review_flag": "review_flag",
             "species_verification_status": "species_verification_status",
@@ -1557,6 +1618,20 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
                 "PrimaryID": record_id,
                 "TimeStampModified": datetime.now()
             }]
+
+        # Collector lives on verbatim_locality (not primary_temp); update it there.
+        if (getattr(update_data, "collector_name", None) is not None
+                and existing_record.get("verbatim_localityid")):
+            await execute_mutation(
+                'UPDATE verbatim_locality SET "verbatim_collector" = $1 '
+                'WHERE "verbatim_localityid" = $2',
+                update_data.collector_name, existing_record["verbatim_localityid"])
+
+        # When a taxon was set, run both family checks (reference + imported-vs-matched)
+        # and record any warnings (best-effort, never raises). Status is left to the
+        # curator's explicit choice here (manual edit is trusted).
+        if getattr(update_data, "taxon_id", None) is not None:
+            await apply_family_checks(record_id, update_data.taxon_id)
 
         # If taxonomic or locality fields were updated, also update preparation records if needed (保持现有逻辑不变)
         prep_update_needed = False
@@ -2449,17 +2524,26 @@ async def apply_taxonomic_suggestion(record_id: int):
 
         suggested_taxon_id = suggestion_result[0]["matched_taxon_id"]
 
+        # Two family checks before deciding status:
+        #  - reference (matched taxon vs fish reference): if it disagrees, do NOT auto-verify
+        #    -> leave species status 'pending' (the path that used to silently verify Amia).
+        #  - suggestion (imported family vs matched family): warning only (surfaces wrong/
+        #    reclassified source families like DOROSOMA filed as CYPRINIDAE).
+        ref_warning = await family_reference_warning(suggested_taxon_id)
+        sugg_warning = await family_suggestion_warning(record_id, suggested_taxon_id)
+        species_status = "pending" if ref_warning else "verified"
+
         # 应用建议并更新验证状态
         apply_query = """
         UPDATE primary_temp
         SET "TaxonID" = $1,
-            "species_verification_status" = 'verified',
-            "TimeStampModified" = $2
-        WHERE "PrimaryID" = $3
+            "species_verification_status" = $2,
+            "TimeStampModified" = $3
+        WHERE "PrimaryID" = $4
         RETURNING "PrimaryID"
         """
 
-        apply_result = await execute_query(apply_query, suggested_taxon_id, datetime.now(), record_id)
+        apply_result = await execute_query(apply_query, suggested_taxon_id, species_status, datetime.now(), record_id)
 
         if apply_result:
             # 标记建议已应用
@@ -2473,12 +2557,24 @@ async def apply_taxonomic_suggestion(record_id: int):
 
             await execute_mutation(mark_applied_query, record_id)
 
+            # record (or clear) both family warnings
+            await store_warnings(record_id, [ref_warning, sugg_warning])
+
             return ResponseModel(
                 code=20000,
                 data={
                     "record_id": record_id,
                     "applied_taxon_id": suggested_taxon_id,
-                    "message": "Taxonomic suggestion applied successfully"
+                    "species_verification_status": species_status,
+                    "needs_review": bool(ref_warning),
+                    "family_warning": bool(ref_warning or sugg_warning),
+                    "message": (
+                        "Suggestion applied, but its family disagrees with the reference "
+                        "- left pending for review." if ref_warning
+                        else "Suggestion applied; imported family differs from the matched "
+                        "family - flagged for review." if sugg_warning
+                        else "Taxonomic suggestion applied successfully"
+                    )
                 }
             )
         else:
@@ -2492,6 +2588,69 @@ async def apply_taxonomic_suggestion(record_id: int):
             code=50000,
             message=f"Failed to apply taxonomic suggestion: {str(e)}"
         )
+
+
+@router.post("/records/{record_id}/create-cof-taxon", response_model=ResponseModel)
+async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
+    """Create the CoF-suggested taxon (find-or-create Family + TaxonomicTable, tagged
+    created_via='cof_import') and assign it to the record. Used when the CoF accepted name
+    is missing locally (boundary #2)."""
+    try:
+        genus = (payload.genus or "").strip()
+        species = (payload.species or "").strip()
+        subspecies = (payload.subspecies or "").strip() or None
+        family = (payload.family or "").strip() or None
+        if not genus or not species:
+            return ResponseModel(code=40000, message="genus and species are required")
+
+        # 1. find-or-create Family
+        family_id = None
+        if family:
+            fr = await execute_query(
+                'SELECT "FamilyID" FROM "Family" WHERE lower("FamilyName") = lower($1) LIMIT 1', family)
+            if fr:
+                family_id = fr[0]["FamilyID"]
+            else:
+                ins = await execute_query(
+                    'INSERT INTO "Family" ("FamilyName", created_at, created_via) '
+                    'VALUES ($1, NOW(), $2) RETURNING "FamilyID"', family, "cof_import")
+                family_id = ins[0]["FamilyID"]
+                try:
+                    await handle_data_change("Family", family_id, "INSERT")
+                except Exception:
+                    pass  # ES sync is best-effort; never block the create
+
+        # 2. find-or-create TaxonomicTable taxon
+        full_name = " ".join(x for x in [genus, species, subspecies] if x)
+        find = await execute_query(
+            'SELECT "TaxonID" FROM "TaxonomicTable" WHERE lower("Genus") = lower($1) '
+            'AND lower("Species") = lower($2) AND lower(COALESCE("Subspecies", \'\')) = lower($3) '
+            'ORDER BY "TaxonID" LIMIT 1', genus, species, subspecies or "")
+        if find:
+            taxon_id = find[0]["TaxonID"]
+        else:
+            ins = await execute_query(
+                'INSERT INTO "TaxonomicTable" ("FamilyID","Genus","Species","Subspecies",'
+                '"FullScientificName", created_at, created_via) '
+                'VALUES ($1,$2,$3,$4,$5, NOW(), $6) RETURNING "TaxonID"',
+                family_id, genus, species, subspecies, full_name, "cof_import")
+            taxon_id = ins[0]["TaxonID"]
+            try:
+                await handle_data_change("TaxonomicTable", taxon_id, "INSERT")
+            except Exception:
+                pass  # ES sync is best-effort; never block the create
+
+        # 3. assign to the record + mark species verified, refresh family warnings
+        await execute_mutation(
+            'UPDATE primary_temp SET "TaxonID" = $1, species_verification_status = \'verified\', '
+            '"TimeStampModified" = NOW() WHERE "PrimaryID" = $2', taxon_id, record_id)
+        await apply_family_checks(record_id, taxon_id)
+
+        return ResponseModel(code=20000, data={
+            "taxon_id": taxon_id, "family_id": family_id, "full_name": full_name,
+            "message": f"Created and applied '{full_name}'"})
+    except Exception as e:
+        return ResponseModel(code=50000, message=f"Failed to create CoF taxon: {str(e)}")
 
 
 @router.post("/records/{record_id}/apply-family-taxon", response_model=ResponseModel)

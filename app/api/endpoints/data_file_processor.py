@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,12 @@ from app.db.database import execute_query, execute_mutation
 from app.utils.species_validation import SpeciesNameValidator, validate_scientific_name
 from app.utils.validation import ImportValidationUtils
 from app.utils.db_import import DatabaseUtils
+from app.services.taxon_reference_check import (
+    family_reference_warning, family_suggestion_warning,
+)
+from app.services.synonym_service import SynonymService
+
+_synonym_service = SynonymService()
 
 router = APIRouter()
 
@@ -98,6 +105,42 @@ async def store_validation_result(file_id: str, result: Dict):
 async def get_validation_result(file_id: str):
     """获取验证结果"""
     return validation_storage.get(file_id)
+
+
+async def persist_batch_source_file(file_info: Dict, batch_serial_id: str,
+                                    import_mode: str, row_count: Optional[int] = None):
+    """Retain the original uploaded file for a successfully imported batch and register
+    it (batch_source_file) so the batch detail page can show + download it.
+
+    Copies temp/<id>_<name> -> storage/batch_sources/<batch_serial_id><ext> (outside the
+    temp dir that gets cleaned). Best-effort: any failure is logged, never breaks import.
+    """
+    try:
+        src = file_info.get("filePath")
+        name = file_info.get("fileName") or "source"
+        if not src or not os.path.exists(src):
+            print(f"persist_batch_source_file: source missing for {batch_serial_id} ({src})")
+            return
+        os.makedirs("storage/batch_sources", exist_ok=True)
+        ext = os.path.splitext(name)[1] or os.path.splitext(src)[1]
+        dest = f"storage/batch_sources/{batch_serial_id}{ext}"
+        shutil.copy2(src, dest)
+        await execute_mutation(
+            """
+            INSERT INTO batch_source_file
+                (batch_serial_id, file_name, stored_path, import_mode, row_count, uploaded_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (batch_serial_id) DO UPDATE SET
+                file_name = EXCLUDED.file_name,
+                stored_path = EXCLUDED.stored_path,
+                import_mode = EXCLUDED.import_mode,
+                row_count = EXCLUDED.row_count,
+                uploaded_at = NOW()
+            """,
+            batch_serial_id, name, dest, import_mode, row_count,
+        )
+    except Exception as e:  # best-effort: must not break the import
+        print(f"persist_batch_source_file failed for {batch_serial_id}: {e}")
 
 
 async def store_import_status(file_id: str, status_data: Dict):
@@ -227,7 +270,7 @@ async def validate_mapping(mapping_data: ImportMappingModel):
         }
 
         # 1. 验证必需字段
-        required_fields = ["prevNumber"]
+        required_fields = ["sourceId", "prevNumber"]
         missing_fields = [field for field in required_fields if field not in mappings or not mappings[field]]
 
         if missing_fields:
@@ -236,6 +279,28 @@ async def validate_mapping(mapping_data: ImportMappingModel):
                 data={},
                 message=f"Missing required field mappings: {', '.join(missing_fields)}"
             )
+
+        # 1b. Source unique ID 校验：本文件内唯一 + 非空 + 整数（存为 source_primary_id 做溯源）。
+        #     注意：是 batch 内唯一，不是数据库列唯一约束。
+        src_col = mappings.get("sourceId")
+        if not src_col or src_col not in df.columns:
+            return ResponseModel(code=40000, data={},
+                message=f"Mapped Source unique ID column '{src_col}' not found in the file.")
+        src_series = df[src_col]
+        blank_cnt = int((src_series.isna() | (src_series.astype(str).str.strip() == "")).sum())
+        if blank_cnt:
+            return ResponseModel(code=40000, data={},
+                message=f"Source unique ID '{src_col}' has {blank_cnt} empty value(s); every row needs one.")
+        try:
+            src_series.astype(str).str.strip().astype(float).astype("int64")
+        except (ValueError, TypeError):
+            return ResponseModel(code=40000, data={},
+                message=f"Source unique ID '{src_col}' must contain integer values.")
+        dup_vals = src_series[src_series.duplicated(keep=False)]
+        if len(dup_vals):
+            sample = ", ".join(map(str, list(dict.fromkeys(dup_vals.tolist()))[:5]))
+            return ResponseModel(code=40000, data={},
+                message=f"Source unique ID '{src_col}' must be unique within the file. Duplicates: {sample}")
 
         # 2. 批量匹配分类学名称 - 使用物种验证器
         taxonomic_data = []
@@ -471,6 +536,7 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
             locality_status = "pending"
             record_status = "pending"
             warnings = []
+            family_warnings = []  # family reference / suggestion checks (added to detail below)
 
             # 读取已有的import warnings
             existing_warnings = []
@@ -494,6 +560,17 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
                         "sql": 'UPDATE primary_temp SET "TaxonID" = $1 WHERE "PrimaryID" = $2',
                         "params": [matched_taxon_id, primary_id]
                     })
+                    # family checks on the auto-applied taxon:
+                    #  - reference mismatch -> warning + downgrade species to pending (review)
+                    #  - imported-vs-matched family mismatch -> warning only (surfaces the
+                    #    wrong/reclassified source family, e.g. DOROSOMA filed as CYPRINIDAE)
+                    ref_w = await family_reference_warning(matched_taxon_id)
+                    sugg_w = await family_suggestion_warning(primary_id, matched_taxon_id)
+                    if ref_w:
+                        family_warnings.append(ref_w)
+                        species_status = "pending"
+                    if sugg_w:
+                        family_warnings.append(sugg_w)
                 print(f"Record {primary_id}: Species verified (exact match), TaxonID={matched_taxon_id}")
             else:
                 print(f"Record {primary_id}: Species pending (match_status: {record['species_match_status']})")
@@ -617,8 +694,8 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
             # 5. 构建更新语句
             verification_notes = f"Auto-verified on import. Warnings: {'; '.join(warnings)}" if warnings else "Auto-verified on import"
 
-            # 合并已有的import warnings和新检测到的warnings
-            all_warnings = existing_warnings + record_warnings_detail
+            # 合并已有的import warnings、字段warnings、family检查warnings
+            all_warnings = existing_warnings + record_warnings_detail + family_warnings
             warnings_json_str = json.dumps(all_warnings) if all_warnings else None
 
             update_sql = """
@@ -700,6 +777,20 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
                     "match_type": "no_match",
                     "confidence": 0
                 })
+
+                # CoF 校正（同 verbatim）：verbatim 名 -> CoF accepted -> 正确 rank 的本地 taxon
+                _g = row.get(mappings["genus"]) if mappings.get("genus") else ""
+                _s = row.get(mappings["species"]) if mappings.get("species") else ""
+                try:
+                    _cof = await _synonym_service.resolve_to_local_taxon(str(_g or ""), str(_s or ""))
+                except Exception:
+                    _cof = None
+                if _cof and _cof.get("taxon_id"):
+                    match_result = {**match_result, "matched": True,
+                                    "taxon_id": _cof["taxon_id"], "match_type": "exact"}
+                elif _cof and not _cof.get("local_found"):
+                    print(f"[CoF] direct row {index}: accepted '{_cof.get('accepted_name')}' "
+                          f"not in local; kept {match_result.get('taxon_id')}")
 
                 record = {
                     "taxon_id": match_result.get("taxon_id") if match_result["matched"] else None,
@@ -786,8 +877,12 @@ async def process_direct_import(file_id: str, batch_serial_id: str, user_id: Opt
             "success": True,
             "userId": user_id,
             "batchSerialId": batch_serial_id,
+            "fieldMappings": mappings,
             "preparationIds": prep_ids
         })
+
+        # 保留源上传文件并登记到 batch（供详情页查看/下载），best-effort
+        await persist_batch_source_file(file_info, batch_serial_id, "direct", len(primary_ids))
 
         # 清理临时文件
         if os.path.exists(file_path):
@@ -878,6 +973,42 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             genus_value = row.get(mappings.get("genus", ""), "") if mappings.get("genus") else ""
             species_value = row.get(mappings.get("species", ""), "") if mappings.get("species") else ""
 
+            # CoF 校正：把 verbatim 名经 CoF 解析到 accepted 名，再锁定正确 rank 的本地 taxon
+            # （修正 'Anchoa mitchilli' 撞到本地亚种、同义词未解析等问题）。
+            #  - CoF 不认该名 -> cof=None -> 保留原本地匹配（边界1）
+            #  - CoF 有 accepted 但本地无此 taxon -> 保留原匹配 + 记日志（边界2）
+            #  - CoF 有 accepted 且本地命中 -> 用 CoF 正确的本地 taxon 覆盖（主路径）
+            try:
+                cof = await _synonym_service.resolve_to_local_taxon(
+                    str(genus_value or ""), str(species_value or ""))
+            except Exception:
+                cof = None
+            if cof and cof.get("taxon_id"):
+                match_result = {
+                    **match_result,
+                    "matched": True,
+                    "taxon_id": cof["taxon_id"],
+                    "match_status": "exact",
+                    "confidence": 100,
+                    "match_info": {"source": "cof_resolved",
+                                   "accepted_name": cof.get("accepted_name"),
+                                   "cof_status": cof.get("status")},
+                }
+            elif cof and not cof.get("local_found"):
+                # CoF 有 accepted 但本地没有 -> 保留 DB 近似建议 + 附「建议创建 CoF 名」
+                _mi = match_result.get("match_info")
+                _mi = _mi if isinstance(_mi, dict) else {}
+                match_result = {**match_result, "match_info": {**_mi, "cof_create": {
+                    "genus": cof.get("cof_genus"),
+                    "species": cof.get("cof_species"),
+                    "subspecies": cof.get("cof_subspecies"),
+                    "family": cof.get("cof_family"),
+                    "accepted_name": cof.get("accepted_name"),
+                    "status": cof.get("status"),
+                }}}
+                print(f"[CoF] row {index}: accepted '{cof.get('accepted_name')}' "
+                      f"({cof.get('cof_family')}) not in local -> create-suggestion attached")
+
             verbatim_taxonomic_record = {
                 "verbatim_family": str(family_value) if pd.notna(family_value) and str(family_value).strip() else None,
                 "verbatim_genus": str(genus_value) if pd.notna(genus_value) and str(genus_value).strip() else None,
@@ -904,6 +1035,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "verbatim_latitude": None,
                 "verbatim_longitude": None,
                 "verbatim_fieldno": None,
+                "verbatim_collector": None,
                 "original_text": None
             }
 
@@ -917,7 +1049,8 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "waterbody": "verbatim_waterbody",
                 "latitude": "verbatim_latitude",
                 "longitude": "verbatim_longitude",
-                "fieldNumber": "verbatim_fieldno"
+                "fieldNumber": "verbatim_fieldno",
+                "collectorName": "verbatim_collector"
             }
 
             locality_parts = []
@@ -987,6 +1120,8 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         record["storage"] = str(value) if not pd.isna(value) else None
                     elif field == "jarSize":
                         record["jar_size"] = str(value) if not pd.isna(value) else None
+                    elif field == "typeStatus":
+                        record["type_status"] = str(value) if not pd.isna(value) else None
                     elif field == "prevNumber":
                         record["prev_number"] = str(value) if not pd.isna(value) else None
                     elif field == "inventory":
@@ -996,14 +1131,24 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         if not pd.isna(value) and str(value).strip():
                             record["remarks"] = f"{str(value).strip()} | {existing_remarks}"
 
+            # Source unique ID -> source_primary_id (traceability back to the source dataset).
+            # Validated unique+integer at validate_mapping; store as int.
+            src_col = mappings.get("sourceId")
+            if src_col and src_col in df.columns:
+                sval = row.get(src_col)
+                try:
+                    record["source_primary_id"] = int(float(sval)) if pd.notna(sval) else None
+                except (ValueError, TypeError):
+                    record["source_primary_id"] = None
+
             valid_records.append(record)
             total_numbers.append(record["total_number"])
 
         # 4. 批量插入verbatim记录
-        print(f"插入 {len(verbatim_taxonomic_records)} 条 verbatim taxonomic 记录...")
+        print(f"Inserting {len(verbatim_taxonomic_records)} verbatim taxonomic records...")
         verbatim_taxonomic_ids = await db_utils.insert_verbatim_taxonomic_records(verbatim_taxonomic_records)
 
-        print(f"插入 {len(verbatim_locality_records)} 条 verbatim locality 记录...")
+        print(f"Inserting {len(verbatim_locality_records)} verbatim locality records...")
         verbatim_locality_ids = await db_utils.insert_verbatim_locality_records(verbatim_locality_records)
 
         # TODO(#4 死分配): verbatim 导入写的是 primary_temp，它会【自己生成临时字符串号】
@@ -1019,15 +1164,15 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             record["verbatim_locality_id"] = verbatim_locality_ids[i] if i < len(verbatim_locality_ids) else None
 
         # 7. 插入 primary_temp 记录（verbatim 模式使用临时表）
-        print(f"插入 {len(valid_records)} 条 primary_temp 记录...")
+        print(f"Inserting {len(valid_records)} primary_temp records...")
         primary_temp_ids = await db_utils.insert_primary_temp_records(valid_records, batch_serial_id)
 
         # 8. 插入 preparation_temp 记录
-        print(f"插入 {len(primary_temp_ids)} 条 preparation_temp 记录...")
+        print(f"Inserting {len(primary_temp_ids)} preparation_temp records...")
         prep_temp_ids = await db_utils.insert_preparation_temp_records(primary_temp_ids, total_numbers, "Fluid")
 
         # 8.5. 自动验证导入的记录并更新验证状态
-        print(f"开始自动验证 {len(primary_temp_ids)} 条记录...")
+        print(f"Auto-verifying {len(primary_temp_ids)} records...")
         await auto_verify_imported_records(primary_temp_ids, batch_serial_id)
 
         # 9. 更新导入状态
@@ -1041,20 +1186,24 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
             "success": True,
             "userId": user_id,
             "batchSerialId": batch_serial_id,
+            "fieldMappings": mappings,
             "preparationTempIds": prep_temp_ids,
             "verbatimTaxonomicIds": verbatim_taxonomic_ids,
             "verbatimLocalityIds": verbatim_locality_ids,
             "note": "Records imported in verbatim mode (temp tables) - all original data and matching results preserved for manual review and final import"
         })
 
+        # 9.5. 保留源上传文件并登记到 batch（供详情页查看/下载），best-effort
+        await persist_batch_source_file(file_info, batch_serial_id, "verbatim", len(primary_temp_ids))
+
         # 10. 清理临时文件
         if os.path.exists(file_path):
             os.remove(file_path)
 
-        print(f"Verbatim导入完成: {len(primary_temp_ids)} 条记录 (存入临时表)")
+        print(f"Verbatim import done: {len(primary_temp_ids)} records (staged in temp tables)")
 
     except Exception as e:
-        print(f"Verbatim导入失败: {str(e)}")
+        print(f"Verbatim import failed: {str(e)}")
         await store_import_status(file_id, {
             "fileId": file_id,
             "status": "failed",

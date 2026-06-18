@@ -172,6 +172,73 @@ class SynonymService:
             'names': sorted(set(names))
         }
 
+    async def resolve_to_local_taxon(self, genus: str, species: str) -> Optional[Dict[str, Any]]:
+        """Resolve a verbatim genus+species through CoF to its ACCEPTED name, then return
+        the matching LOCAL TaxonomicTable taxon AT THE ACCEPTED RANK (a species accepted
+        name -> the species-level row with empty Subspecies; a subspecies accepted name ->
+        the row with that Subspecies). This fixes verbatim 'Anchoa mitchilli' resolving to a
+        local subspecies row instead of the valid species.
+
+        Returns None when CoF doesn't know the name (caller should fall back to local match).
+        Otherwise {accepted_name, status, taxon_id, family_name, local_found}; taxon_id/
+        local_found are None/False when CoF has an accepted name the local table lacks.
+        """
+        name = " ".join(x for x in [(genus or "").strip(), (species or "").strip()] if x).strip()
+        if not name:
+            return None
+        try:
+            r = await self.resolve_group(name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("resolve_to_local_taxon: resolve_group failed for %r: %s", name, e)
+            return None
+        if not r.get("found") or not r.get("accepted_name"):
+            return None  # not in CoF -> caller falls back to existing local matching
+
+        accepted = r["accepted_name"].strip()
+        parts = accepted.split()
+        g = parts[0] if parts else ""
+        s = parts[1] if len(parts) > 1 else ""
+        sub = " ".join(parts[2:]) if len(parts) > 2 else ""
+
+        if sub:
+            rows = await execute_query(
+                'SELECT tt."TaxonID", f."FamilyName" FROM "TaxonomicTable" tt '
+                'LEFT JOIN "Family" f ON tt."FamilyID" = f."FamilyID" '
+                'WHERE lower(tt."Genus") = lower($1) AND lower(tt."Species") = lower($2) '
+                'AND lower(COALESCE(tt."Subspecies", \'\')) = lower($3) '
+                'ORDER BY tt."TaxonID" LIMIT 1', g, s, sub)
+        else:
+            rows = await execute_query(
+                'SELECT tt."TaxonID", f."FamilyName" FROM "TaxonomicTable" tt '
+                'LEFT JOIN "Family" f ON tt."FamilyID" = f."FamilyID" '
+                'WHERE lower(tt."Genus") = lower($1) AND lower(tt."Species") = lower($2) '
+                'AND (tt."Subspecies" IS NULL OR TRIM(tt."Subspecies") = \'\') '
+                'ORDER BY tt."TaxonID" LIMIT 1', g, s)
+
+        out = {
+            "accepted_name": accepted,
+            "status": r.get("status"),
+            "taxon_id": rows[0]["TaxonID"] if rows else None,
+            "family_name": rows[0]["FamilyName"] if rows else None,
+            "local_found": bool(rows),
+            "cof_genus": g,
+            "cof_species": s,
+            "cof_subspecies": sub or None,
+            "cof_family": None,
+        }
+        # 本地没有该 accepted taxon -> 附上 CoF 的科名（取 accepted genus 在 CoF 的 FAMILY），
+        # 供 review 端"建议创建 CoF 名"。
+        if not rows and g:
+            try:
+                fam = await execute_taxon_query(
+                    "SELECT fam.scientific_name AS family "
+                    "FROM taxa gg JOIN taxa fam ON gg.parent_id = fam.id AND fam.rank = 'FAMILY' "
+                    "WHERE gg.rank = 'GENUS' AND lower(gg.scientific_name) = lower($1) LIMIT 1", g)
+                out["cof_family"] = fam[0]["family"] if fam else None
+            except Exception:
+                out["cof_family"] = None
+        return out
+
     async def tag_status(self, names: List[str]) -> Dict[str, Any]:
         """批量给一组名打 taxonomy_dev 状态标：返回 {normalized_name: 'valid'|'synonym'}。
         用于 lots 搜索结果的来源色标。taxonomy_dev 未配置/连不上则返回空（无标签）。
