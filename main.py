@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin, data_file_processor, batch_review, taxon_review
+from app.api.endpoints import ulm, ost, loan, locality, taxon, search, lots, login, species_stats, person, admin, data_file_processor, batch_review, taxon_review, family_policy, taxon_merge, genus_audit
 from app.db.elasticsearch import init_es, close_es
 from app.core.config import settings
 from app.middleware.request_logging import RequestLoggingMiddleware
@@ -47,6 +47,9 @@ app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(data_file_processor.router, prefix="/api/file", tags=["File Processor"])
 app.include_router(batch_review.router, prefix="/api/batch", tags=["Batch Processor"])
 app.include_router(taxon_review.router, prefix="/api/synonym-review", tags=["Synonym Review"])
+app.include_router(family_policy.router, prefix="/api/family-policy", tags=["Family Policy"])
+app.include_router(taxon_merge.router, prefix="/api/taxon-merge", tags=["Taxon Merge"])
+app.include_router(genus_audit.router, prefix="/api/genus-audit", tags=["Genus Audit"])
 #
 @app.on_event("startup")
 async def startup_db_client():

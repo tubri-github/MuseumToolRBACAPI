@@ -200,20 +200,30 @@ class SynonymService:
         s = parts[1] if len(parts) > 1 else ""
         sub = " ".join(parts[2:]) if len(parts) > 2 else ""
 
+        # Tie-break when the same name exists on more than one local taxon (the museum has
+        # 50 such colliding Genus+Species groups): attach to the taxon the collection is
+        # already ON, i.e. the one with the most current determinations, and only fall back
+        # to the lowest TaxonID when that ties. Picking the lowest id outright sent specimens
+        # to the minority row for 13 of the 50 groups -- e.g. Notropis atherinoides would
+        # have gone to TaxonID 8046 (460 determinations) instead of 9172 (3684).
+        # Determination."TaxonID" is indexed, so the correlated count is cheap.
+        order_by = ('ORDER BY (SELECT count(*) FROM "Determination" d '
+                    '          WHERE d."TaxonID" = tt."TaxonID" AND d."IsCurrent" IS TRUE) DESC, '
+                    '         tt."TaxonID" ASC LIMIT 1')
         if sub:
             rows = await execute_query(
                 'SELECT tt."TaxonID", f."FamilyName" FROM "TaxonomicTable" tt '
                 'LEFT JOIN "Family" f ON tt."FamilyID" = f."FamilyID" '
                 'WHERE lower(tt."Genus") = lower($1) AND lower(tt."Species") = lower($2) '
                 'AND lower(COALESCE(tt."Subspecies", \'\')) = lower($3) '
-                'ORDER BY tt."TaxonID" LIMIT 1', g, s, sub)
+                + order_by, g, s, sub)
         else:
             rows = await execute_query(
                 'SELECT tt."TaxonID", f."FamilyName" FROM "TaxonomicTable" tt '
                 'LEFT JOIN "Family" f ON tt."FamilyID" = f."FamilyID" '
                 'WHERE lower(tt."Genus") = lower($1) AND lower(tt."Species") = lower($2) '
                 'AND (tt."Subspecies" IS NULL OR TRIM(tt."Subspecies") = \'\') '
-                'ORDER BY tt."TaxonID" LIMIT 1', g, s)
+                + order_by, g, s)
 
         out = {
             "accepted_name": accepted,

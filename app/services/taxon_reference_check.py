@@ -32,13 +32,40 @@ MANAGED = (ISSUE_REFERENCE, ISSUE_SUGGESTION)
 ISSUE_TYPE = ISSUE_REFERENCE  # backward-compat alias
 
 
+async def _policy_exempt(local_family, ref_families):
+    """Drop the reference families the museum has already decided to ignore for this
+    local family (family_reference_policy, decision='keep_local').
+
+    Returns the families still in genuine disagreement. A pair that is not recorded as
+    policy still disagrees, so a real misfiling is never masked. Best-effort: if the
+    table is missing (migration not run), nothing is exempted.
+    """
+    if not ref_families:
+        return set()
+    try:
+        rows = await execute_query(
+            "SELECT reference_family FROM family_reference_policy "
+            "WHERE decision = 'keep_local' AND revoked_at IS NULL "
+            "AND lower(local_family) = lower($1) "
+            "AND lower(reference_family) = ANY($2::text[])",
+            local_family, [f.lower() for f in ref_families],
+        )
+    except Exception as e:  # noqa: BLE001 - advisory; never break the caller
+        logger.warning("family_reference_policy lookup failed: %s", e)
+        return set(ref_families)
+    exempt = {r["reference_family"].lower() for r in rows}
+    return {f for f in ref_families if f.lower() not in exempt}
+
+
 async def family_reference_warning(taxon_id):
     """Return a warning dict if the local taxon's family disagrees with the fish
     reference (genus->family), else None.
 
     Returns None when: no taxon, family-level placeholder taxon (no genus),
     reference not configured, the genus is unknown to the reference (non-fish /
-    fossil / placeholder), or the family already agrees with the reference.
+    fossil / placeholder), the family already agrees with the reference, or every
+    disagreeing reference family is exempted by family_reference_policy (a
+    classification opinion the museum has already ruled on -- see that migration).
     """
     if taxon_id is None or not is_taxon_db_configured():
         return None
@@ -67,6 +94,11 @@ async def family_reference_warning(taxon_id):
     # case-insensitive: local family names are inconsistently cased (e.g. POTAMOTRYGONIDAE)
     if not ref_fams or local_fam.lower() in {f.lower() for f in ref_fams}:
         return None  # genus unknown to reference, or family agrees -> no warning
+
+    # A disagreement the museum has already ruled on is not the curator's problem again.
+    ref_fams = await _policy_exempt(local_fam, ref_fams)
+    if not ref_fams:
+        return None
 
     return {
         "field": "Family",
