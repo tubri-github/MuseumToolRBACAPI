@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import os
 
@@ -7,8 +7,9 @@ from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional, Union
 from pydantic import BaseModel
 
-from app.db.database import execute_query, execute_mutation, execute_paginated_query_with_count
-from app.services.es_sync import handle_data_change
+import asyncpg
+
+from app.db.database import execute_query, execute_mutation, execute_paginated_query_with_count, get_db
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 
 router = APIRouter()
@@ -59,8 +60,95 @@ LOCALITY_SPEC = FilterSpec(
 )
 
 
+# ---- 表单入参归一化 ----
+# 前端表单里的空值一律是 ''（el-input / el-date-picker 的初值），到了这里要变成 NULL；
+# 数字列拿到的也是字符串。asyncpg 不做任何隐式转换，所以在进 SQL 前统一处理。
+
+def _blank(v):
+    """'' / 全空白 -> None（FieldNo 等可空列要存 NULL，UNIQUE 允许多个 NULL，'' 只允许一个）。"""
+    if v is None:
+        return None
+    if isinstance(v, str) and not v.strip():
+        return None
+    return v
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_coord(v, field, lo, hi):
+    """经纬度：空 -> NULL；填了但解析不出来 -> 400。
+    原来一律 _to_float 静默返回 None，策展人把 38.12417 打成 '38.12.417' 时坐标会无声消失。
+    顺带做范围校验，挡住 lat/lon 填反这类错误。"""
+    if _blank(v) is None:
+        return None
+    f = _to_float(v)
+    if f is None:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: {v}")
+    if not (lo <= f <= hi):
+        raise HTTPException(status_code=400, detail=f"{field} out of range ({lo}..{hi}): {f}")
+    return f
+
+
+def _to_ts(v, field=""):
+    """表单日期 -> datetime（timestamp 列）。
+    前端 date-picker 默认发的是带 Z 的 ISO（'2026-08-12T05:00:00.000Z'），也兼容 'YYYY-MM-DD'。
+    带时区的按 UTC 落到 naive，和 locality1 的 timestamp without time zone 对齐。"""
+    if _blank(v) is None:
+        return None
+    if isinstance(v, datetime):
+        return v.astimezone(timezone.utc).replace(tzinfo=None) if v.tzinfo else v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    s = str(v).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid date{' for ' + field if field else ''}: {v}")
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def _date_warnings(start_ts: Optional[datetime], end_ts: Optional[datetime]) -> List[str]:
+    """采集日期区间的提醒。**只提醒不拦截**：库里已经有 EndDate 早于 StartDate 的历史记录，
+    硬拦会让策展人连打开那些记录再保存都做不到。同一天算正常（当天采完）。"""
+    warnings = []
+    if start_ts and end_ts and end_ts < start_ts:
+        warnings.append(
+            f"End date {end_ts.date()} is before start date {start_ts.date()}. "
+            f"Saved as entered — please check the dates.")
+    return warnings
+
+
+def _ymd(ts: Optional[datetime]):
+    """locality1 的 year/month/day 是采集日期的拆分列，跟着 StartDate 走；无 StartDate 则为 NULL。"""
+    return (ts.year, ts.month, ts.day) if ts else (None, None, None)
+
+
+def _collector_ids(rows: Optional[List[Dict[str, Any]]]) -> List[int]:
+    """挑出真正选了人的 collector 行。表单默认带一行空的 {collectorName:'', collectorID:''}，
+    直接插会以 '' 撞 integer 列（22P02）；顺带去重，避免同一个人重复关联。"""
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            cid = int(row.get("collectorID"))
+        except (TypeError, ValueError):
+            continue
+        if cid and cid not in out:
+            out.append(cid)
+    return out
+
+
 class LocalityModel(BaseModel):
-    fieldNo: str
+    # FieldNo 可为空（现场不一定给得到），空串按 NULL 存
+    fieldNo: Optional[str] = None
     localityString: Optional[str] = None
     drainage: Optional[str] = None
     waterbody: Optional[str] = None
@@ -68,10 +156,11 @@ class LocalityModel(BaseModel):
     continent: Optional[str] = None
     state: Optional[str] = None
     county: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    startDate: Optional[str] = None
-    endDate: Optional[str] = None
+    # 表单是 el-input，来的是字符串；不填时是 ''，声明成 float 会直接 422
+    latitude: Optional[Union[str, float]] = None
+    longitude: Optional[Union[str, float]] = None
+    startDate: Optional[Union[str, datetime]] = None
+    endDate: Optional[Union[str, datetime]] = None
     verbatimDate: Optional[str] = None
     remark: Optional[str] = None
     inventory: Optional[str] = None
@@ -83,45 +172,8 @@ class ResponseModel(BaseModel):
     code: int
     data: Dict[str, Any]
 
-class LocalitySearchModel(BaseModel):
-    fieldNo: Optional[str] = None
-    localityString: Optional[str] = None
-    country: Optional[str] = None
-    state: Optional[str] = None
-    county: Optional[str] = None
-    drainage: Optional[str] = None
-    waterbody: Optional[str] = None
-    fuzzySearch: Optional[bool] = True
-
-class LocalityCreateModel(BaseModel):
-    FieldNo: str
-    LocalityString: str
-    Drainage: Optional[str] = None
-    Country: str
-    State: str
-    County: Optional[str] = None
-    Continent: str
-    Island: Optional[str] = None
-    IslandGroup: Optional[str] = None
-    ElevationMethod: Optional[str] = None
-    WaterBody: Optional[str] = None
-    Lon: Optional[float] = None
-    Lat: Optional[float] = None
-    StartDate: Optional[Union[str, date]] = None  # 允许字符串或日期对象
-    EndDate: Optional[Union[str, date]] = None    # 允许字符串或日期对象
-    VerbatimDate: Optional[str] = None
-    year: Optional[int] = None
-    month: Optional[int] = None
-    day: Optional[int] = None
-    Remarks: Optional[str] = None
-    Inventory: Optional[str] = None
-    VerbatimCollectors: Optional[str] = None
-
-    class Config:
-        # 允许字符串日期自动转换
-        json_encoders = {
-            date: lambda v: v.isoformat() if v else None
-        }
+# 注：LocalitySearchModel / LocalityCreateModel 原本这里还有一份同名定义，但文件后面各自
+# 又定义了一次，Python 只有后者生效——改前面那份不起任何作用，容易看错。已删。
 
 @router.get("/locality/{keyword}", response_model=ResponseModel)
 async def get_locality(keyword: str):
@@ -158,17 +210,12 @@ async def new_locality(data: LocalityModel):
     Create a new locality.
     Mirrors the original newLocality function.
     """
-    # Get current date components for the insertion
-    query1 = """
-    SELECT EXTRACT(YEAR FROM CURRENT_DATE) as year,
-           EXTRACT(MONTH FROM CURRENT_DATE) as month,
-           EXTRACT(DAY FROM CURRENT_DATE) as day
-    """
-
-    date_result = await execute_query(query1)
-    year = int(date_result[0]["year"])
-    month = int(date_result[0]["month"])
-    day = int(date_result[0]["day"])
+    # year/month/day 是采集日期的拆分列，不是入库日期：从 StartDate 推。
+    # （原来写的是 CURRENT_DATE，等于把"今天"当成采集年月日；没有 StartDate 时留 NULL 才是诚实的。）
+    start_ts = _to_ts(data.startDate, "startDate")
+    end_ts = _to_ts(data.endDate, "endDate")
+    year, month, day = _ymd(start_ts)
+    warnings = _date_warnings(start_ts, end_ts)
 
     # Insert new locality
     query2 = """
@@ -181,65 +228,76 @@ async def new_locality(data: LocalityModel):
     RETURNING "Locality1ID", "FieldNo"
     """
 
+    field_no = _blank(data.fieldNo)
+    collector_ids = _collector_ids(data.zCollectorsLocality)
+
     try:
-        # Execute the insertion
-        locality_result = await execute_query(
-            query2,
-            data.fieldNo,
-            data.localityString,
-            data.drainage,
-            data.waterbody,
-            data.country,
-            data.continent,
-            data.state,
-            data.county,
-            data.latitude,
-            data.longitude,
-            data.startDate,
-            data.endDate,
-            data.verbatimDate,
-            data.remark,
-            data.inventory,
-            data.verbatimCollectors,
-            year,
-            month,
-            day
-        )
+        # locality + collectors 必须一起成败：以前分两次独立连接写，collectors 失败会留下
+        # 一条没有采集人的孤儿产地，用户重试还会撞 FieldNo 唯一约束。
+        async with get_db() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    query2,
+                    field_no,
+                    _blank(data.localityString),
+                    _blank(data.drainage),
+                    _blank(data.waterbody),
+                    _blank(data.country),
+                    _blank(data.continent),
+                    _blank(data.state),
+                    _blank(data.county),
+                    _to_coord(data.latitude, "latitude", -90, 90),
+                    _to_coord(data.longitude, "longitude", -180, 180),
+                    start_ts,
+                    end_ts,
+                    _blank(data.verbatimDate),
+                    _blank(data.remark),
+                    _blank(data.inventory),
+                    _blank(data.verbatimCollectors),
+                    year,
+                    month,
+                    day
+                )
 
-        if not locality_result or len(locality_result) == 0:
-            raise HTTPException(status_code=500, detail="Failed to create locality")
+                if not row:
+                    raise HTTPException(status_code=500, detail="Failed to create locality")
 
-        locality_id = locality_result[0]["Locality1ID"]
-        field_number = locality_result[0]["FieldNo"]
+                locality_id = row["Locality1ID"]
+                field_number = row["FieldNo"]
 
-        # Insert collectors for the locality if provided
-        if data.zCollectorsLocality and len(data.zCollectorsLocality) > 0:
-            # Build values for insertion
-            collectors_values = []
-            for collector in data.zCollectorsLocality:
-                collectors_values.append(f"('{field_number}', '{collector['collectorID']}', {locality_id})")
+                # Insert collectors for the locality if provided.
+                # 全参数化：FieldNo 带撇号（O'Brien-1）以前会把拼出来的 SQL 打断。
+                if collector_ids:
+                    await conn.execute(
+                        '''
+                        INSERT INTO "CollectorsLocality" ("StationFieldNumber", "CollectorID", "Locality1ID")
+                        SELECT $1, c, $3 FROM unnest($2::int[]) AS c
+                        ''',
+                        field_number, collector_ids, locality_id,
+                    )
 
-            collectors_values_str = ", ".join(collectors_values)
-
-            query3 = f"""
-            INSERT INTO "CollectorsLocality" ("StationFieldNumber", "CollectorID", "Locality1ID")
-            VALUES {collectors_values_str}
-            """
-
-            await execute_mutation(query3)
-
-        # Sync the new data to Elasticsearch
-        await handle_data_change("locality1", locality_id, "INSERT")
+        if warnings:
+            print(f"Locality {locality_id} created with warnings: {'; '.join(warnings)}")
 
         return {
             "code": 20000,
             "data": {
                 "localityID": locality_id,
+                "warnings": warnings,
                 "total": 1
             }
         }
 
+    except HTTPException:
+        # 400（日期格式）等已经是给前端看的错误，别被下面重新包成 500
+        raise
+    except asyncpg.exceptions.UniqueViolationError:
+        # FieldNo 唯一约束。放在这里而不是先 SELECT 再插，是为了同时挡住并发下的竞态。
+        raise HTTPException(status_code=409, detail=f"Field No '{field_no}' already exists")
+    except asyncpg.exceptions.ForeignKeyViolationError:
+        raise HTTPException(status_code=400, detail="One of the selected collectors no longer exists")
     except Exception as e:
+        print(f"Error creating locality: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -397,43 +455,123 @@ class LocalityUpdateModel(BaseModel):
     county: Optional[str] = None
     latitude: Optional[Union[str, float]] = None
     longitude: Optional[Union[str, float]] = None
-    startDate: Optional[str] = None
-    endDate: Optional[str] = None
+    startDate: Optional[Union[str, datetime]] = None
+    endDate: Optional[Union[str, datetime]] = None
     verbatimDate: Optional[str] = None
     remark: Optional[str] = None
     inventory: Optional[str] = None
     verbatimCollectors: Optional[str] = None
-
-
-def _to_float(v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
+    zCollectorsLocality: Optional[List[Dict[str, Any]]] = None
+    # 必须显式置 true 才会重写采集人关联行。
+    # 不能只看 zCollectorsLocality 有没有值：**旧版前端也会把表单里默认那行空的发上来**，
+    # 那样"整体重写"就变成了把这条产地的采集人全删光。后端先上线、前端还没刷新时会中招。
+    manageCollectors: Optional[bool] = False
 
 
 @router.post("/update-locality", response_model=ResponseModel)
 async def update_locality(data: LocalityUpdateModel):
     """更新一条已有 locality（编辑复用 add 表单，按 Locality1ID 改）。
-    StartDate/EndDate 是 timestamp（前端可能传带 Z 的字符串），用 NULLIF::timestamp 兼容；Lat/Lon 字符串转 float。"""
-    await execute_mutation(
-        '''
-        UPDATE locality1 SET
-            "FieldNo" = $2, "LocalityString" = $3, "Drainage" = $4, "WaterBody" = $5,
-            "Country" = $6, "Continent" = $7, "State" = $8, "County" = $9,
-            "Lat" = $10, "Lon" = $11,
-            "StartDate" = NULLIF($12, '')::timestamp, "EndDate" = NULLIF($13, '')::timestamp,
-            "VerbatimDate" = $14, "Remarks" = $15, "Inventory" = $16, "VerbatimCollectors" = $17,
-            "TimeStampModified" = NOW()
-        WHERE "Locality1ID" = $1
-        ''',
-        data.localityId, data.fieldNo, data.localityString, data.drainage, data.waterbody,
-        data.country, data.continent, data.state, data.county,
-        _to_float(data.latitude), _to_float(data.longitude),
-        data.startDate or '', data.endDate or '',
-        data.verbatimDate, data.remark, data.inventory, data.verbatimCollectors,
-    )
-    return {"code": 20000, "data": {"items": {"Locality1ID": data.localityId}, "total": 1}}
+    日期/数字/空串的归一化和新建走同一套 helper；year/month/day 跟着 StartDate 一起改，
+    否则改了采集日期这三列还留着旧值。采集人关联行按提交的列表重写。"""
+    start_ts = _to_ts(data.startDate, "startDate")
+    end_ts = _to_ts(data.endDate, "endDate")
+    year, month, day = _ymd(start_ts)
+    field_no = _blank(data.fieldNo)
+    warnings = _date_warnings(start_ts, end_ts)
+
+    try:
+        # 产地本体 + 采集人关联行一起成败
+        async with get_db() as conn:
+            async with conn.transaction():
+                # 改动前的 FieldNo：下面只有在它真的变了时才去动关联行的冗余副本。
+                # 不能无条件同步——库里有 10 条两侧不一致的历史记录，其中 2 条恰恰是 locality1
+                # 这边写错了（见 stationfieldno_drift_report.xlsx），无条件覆盖会把真编号销毁。
+                old_field_no = await conn.fetchval(
+                    'SELECT "FieldNo" FROM locality1 WHERE "Locality1ID" = $1', data.localityId)
+
+                status = await conn.execute(
+                    '''
+                    UPDATE locality1 SET
+                        "FieldNo" = $2, "LocalityString" = $3, "Drainage" = $4, "WaterBody" = $5,
+                        "Country" = $6, "Continent" = $7, "State" = $8, "County" = $9,
+                        "Lat" = $10, "Lon" = $11,
+                        "StartDate" = $12, "EndDate" = $13,
+                        "VerbatimDate" = $14, "Remarks" = $15, "Inventory" = $16, "VerbatimCollectors" = $17,
+                        "year" = $18, "month" = $19, "day" = $20,
+                        "TimeStampModified" = NOW()
+                    WHERE "Locality1ID" = $1
+                    ''',
+                    data.localityId, field_no, _blank(data.localityString), _blank(data.drainage),
+                    _blank(data.waterbody), _blank(data.country), _blank(data.continent), _blank(data.state),
+                    _blank(data.county),
+                    _to_coord(data.latitude, "latitude", -90, 90),
+                    _to_coord(data.longitude, "longitude", -180, 180),
+                    start_ts, end_ts,
+                    _blank(data.verbatimDate), _blank(data.remark), _blank(data.inventory),
+                    _blank(data.verbatimCollectors),
+                    year, month, day,
+                )
+
+                # 以前不检查影响行数：改一条不存在的产地也会返回成功
+                if status.split()[-1] == "0":
+                    raise HTTPException(status_code=404, detail=f"Locality {data.localityId} not found")
+
+                if data.manageCollectors:
+                    # 按列表整体重写（含 StationFieldNumber），删掉的人才会真的消失。
+                    # RETURNING 是为了把删掉了什么打进日志——老数据里有 CollectorID 为 NULL 的
+                    # 遗留行（界面显示不出来），会在这里被一并清掉，属于对历史数据的改动，要留痕。
+                    removed = await conn.fetch(
+                        'DELETE FROM "CollectorsLocality" WHERE "Locality1ID" = $1'
+                        ' RETURNING "CollectorID", "StationFieldNumber"',
+                        data.localityId)
+                    collector_ids = _collector_ids(data.zCollectorsLocality)
+                    if collector_ids:
+                        await conn.execute(
+                            '''
+                            INSERT INTO "CollectorsLocality" ("StationFieldNumber", "CollectorID", "Locality1ID")
+                            SELECT $1, c, $3 FROM unnest($2::int[]) AS c
+                            ''',
+                            field_no, collector_ids, data.localityId,
+                        )
+                    null_rows = sum(1 for r in removed if r["CollectorID"] is None)
+                    if null_rows:
+                        print(f"Locality {data.localityId}: collector rewrite dropped {null_rows} "
+                              f"legacy row(s) with NULL CollectorID")
+                    # 重写会把历史上不一致的 StationFieldNumber 一并抹成当前 FieldNo，留痕
+                    overwritten = {r["StationFieldNumber"] for r in removed
+                                   if r["StationFieldNumber"] is not None
+                                   and r["StationFieldNumber"] != field_no}
+                    if overwritten:
+                        print(f"Locality {data.localityId}: collector rewrite overwrote "
+                              f"StationFieldNumber {sorted(overwritten)!r} with {field_no!r}")
+                elif field_no != old_field_no:
+                    # FieldNo 真的改了才同步冗余副本。没改就别碰——那 10 条历史不一致的记录
+                    # 要等 curator 裁决，不能因为一次无关的编辑就被悄悄抹平。
+                    synced = await conn.fetch(
+                        'UPDATE "CollectorsLocality" SET "StationFieldNumber" = $2'
+                        ' WHERE "Locality1ID" = $1 AND "StationFieldNumber" IS DISTINCT FROM $2'
+                        ' RETURNING "CollectorLocalityID"',
+                        data.localityId, field_no,
+                    )
+                    if synced:
+                        print(f"Locality {data.localityId}: FieldNo {old_field_no!r} -> {field_no!r}, "
+                              f"synced StationFieldNumber on {len(synced)} collector row(s)")
+    except HTTPException:
+        raise
+    except asyncpg.exceptions.UniqueViolationError:
+        # 改成了另一条产地已占用的 FieldNo
+        raise HTTPException(status_code=409, detail=f"Field No '{field_no}' already exists")
+    except asyncpg.exceptions.ForeignKeyViolationError:
+        raise HTTPException(status_code=400, detail="One of the selected collectors no longer exists")
+    except Exception as e:
+        print(f"Error updating locality {data.localityId}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if warnings:
+        print(f"Locality {data.localityId} updated with warnings: {'; '.join(warnings)}")
+
+    return {"code": 20000,
+            "data": {"items": {"Locality1ID": data.localityId}, "warnings": warnings, "total": 1}}
 
 
 # ---- 地理位置建议（gazetteer）：本地受控词表 + GeoNames 全球库 ----
@@ -618,7 +756,9 @@ class LocalitySearchModel(BaseModel):
 
 
 class LocalityCreateModel(BaseModel):
-    FieldNo: str
+    # FieldNo 可为空，和 POST /locality 保持一致（现场不一定给得到）。
+    # 原来声明成必填 str，而调用方 RecordsProcessor 会把空值整个删掉不发 -> 422。
+    FieldNo: Optional[str] = None
     LocalityString: str
     Drainage: Optional[str] = None
     Country: str
@@ -629,10 +769,10 @@ class LocalityCreateModel(BaseModel):
     IslandGroup: Optional[str] = None
     ElevationMethod: Optional[str] = None
     WaterBody: Optional[str] = None
-    Lon: Optional[float] = None
-    Lat: Optional[float] = None
-    StartDate: Optional[str] = None
-    EndDate: Optional[str] = None
+    Lon: Optional[Union[str, float]] = None
+    Lat: Optional[Union[str, float]] = None
+    StartDate: Optional[Union[str, datetime]] = None
+    EndDate: Optional[Union[str, datetime]] = None
     StartTime: Optional[int] = None
     EndTime: Optional[int] = None
     VerbatimDate: Optional[str] = None
@@ -829,9 +969,11 @@ async def check_fieldno_exists(field_no: str):
             }
         }
     except Exception as e:
+        # 注意：ResponseModel 要求 data 必填，缺了会被 FastAPI 变成 500 ResponseValidationError，
+        # 前端就永远看不到这里想返回的错误码/信息了。下面所有错误分支同理。
         return {
             "code": 50000,
-            "message": f"Failed to check field number: {str(e)}"
+            "data": {"message": f"Failed to check field number: {str(e)}"}
         }
 
 
@@ -841,47 +983,25 @@ async def create_new_locality(locality_data: LocalityCreateModel):
     """
     创建新的地点记录
     """
+    field_no = _blank(locality_data.FieldNo)  # '' -> NULL（UNIQUE 只允许一个 ''，但允许多个 NULL）
     try:
-        # 检查FieldNo是否已存在
-        check_result = await execute_query(
-            'SELECT "Locality1ID" FROM locality1 WHERE "FieldNo" = $1',
-            locality_data.FieldNo
-        )
+        # 检查FieldNo是否已存在（为空时跳过：多条无编号产地是允许的）
+        if field_no is not None:
+            check_result = await execute_query(
+                'SELECT "Locality1ID" FROM locality1 WHERE "FieldNo" = $1', field_no)
 
-        if check_result:
-            return {
-                "code": 40900,
-                "message": f"Field No '{locality_data.FieldNo}' already exists",
-                "data": {"existing_locality_id": check_result[0]["Locality1ID"]}
-            }
-
-        # 处理日期转换
-        start_date = None
-        end_date = None
-
-        if locality_data.StartDate:
-            try:
-                if isinstance(locality_data.StartDate, str):
-                    start_date = datetime.strptime(locality_data.StartDate, '%Y-%m-%d').date()
-                else:
-                    start_date = locality_data.StartDate
-            except ValueError as e:
+            if check_result:
                 return {
-                    "code": 40000,
-                    "message": f"Invalid StartDate format: {str(e)}"
+                    "code": 40900,
+                    "message": f"Field No '{field_no}' already exists",
+                    "data": {"existing_locality_id": check_result[0]["Locality1ID"]}
                 }
 
-        if locality_data.EndDate:
-            try:
-                if isinstance(locality_data.EndDate, str):
-                    end_date = datetime.strptime(locality_data.EndDate, '%Y-%m-%d').date()
-                else:
-                    end_date = locality_data.EndDate
-            except ValueError as e:
-                return {
-                    "code": 40000,
-                    "message": f"Invalid EndDate format: {str(e)}"
-                }
+        # 和 POST /locality 用同一个解析器：原来只认严格的 'YYYY-MM-DD'，
+        # 前端哪天改成发带 Z 的 ISO 就会挂（date-picker 的默认行为就是发那个）。
+        start_date = _to_ts(locality_data.StartDate, "StartDate")
+        end_date = _to_ts(locality_data.EndDate, "EndDate")
+        warnings = _date_warnings(start_date, end_date)
 
         # 从日期中提取年月日
         year = None
@@ -915,7 +1035,7 @@ async def create_new_locality(locality_data: LocalityCreateModel):
 
         result = await execute_query(
             insert_query,
-            locality_data.FieldNo,
+            field_no,
             locality_data.LocalityString,
             locality_data.Drainage,
             locality_data.Country,
@@ -926,8 +1046,8 @@ async def create_new_locality(locality_data: LocalityCreateModel):
             locality_data.IslandGroup,
             locality_data.ElevationMethod,
             locality_data.WaterBody,
-            locality_data.Lon,
-            locality_data.Lat,
+            _to_coord(locality_data.Lon, "Lon", -180, 180),
+            _to_coord(locality_data.Lat, "Lat", -90, 90),
             start_date,  # 使用转换后的 date 对象
             end_date,  # 使用转换后的 date 对象
             locality_data.VerbatimDate,
@@ -942,16 +1062,13 @@ async def create_new_locality(locality_data: LocalityCreateModel):
         if not result:
             return {
                 "code": 50000,
-                "message": "Failed to create locality"
+                "data": {"message": "Failed to create locality"}
             }
 
         new_locality = result[0]
 
-        # 同步到Elasticsearch（如果可用）
-        try:
-            await handle_data_change("locality1", new_locality["Locality1ID"], "INSERT")
-        except Exception as es_error:
-            print(f"Elasticsearch sync warning: {es_error}")
+        if warnings:
+            print(f"Locality {new_locality['Locality1ID']} created with warnings: {'; '.join(warnings)}")
 
         return {
             "code": 20000,
@@ -959,14 +1076,18 @@ async def create_new_locality(locality_data: LocalityCreateModel):
                 "Locality1ID": new_locality["Locality1ID"],
                 "FieldNo": new_locality["FieldNo"],
                 "LocalityString": new_locality["LocalityString"],
+                "warnings": warnings,
                 "message": f"Locality created successfully"
             }
         }
+    except HTTPException:
+        # _to_ts 抛的 400（日期格式）要原样上抛，别被下面吞成 50000
+        raise
     except Exception as e:
         print(f"Error creating locality: {str(e)}")
         return {
             "code": 50000,
-            "message": f"Failed to create locality: {str(e)}"
+            "data": {"message": f"Failed to create locality: {str(e)}"}
         }
 
 
@@ -1015,18 +1136,33 @@ async def get_locality_by_id(locality_id: int):
         if not result:
             return {
                 "code": 40400,
-                "message": f"Locality with ID {locality_id} not found"
+                "data": {"message": f"Locality with ID {locality_id} not found"}
             }
+
+        # 关联的采集人：编辑表单要能把已有的人显示出来（以前没查，表单永远只有一行空的，
+        # 策展人在上面改了还会被静默丢弃）。名字一并带上，前端 el-select 才有 label 可显示。
+        collectors = await execute_query(
+            '''
+            SELECT cl."CollectorID" AS "collectorID",
+                   trim(both ' ' from concat_ws(' ', c."FirstName", c."LastName")) AS "collectorName"
+            FROM "CollectorsLocality" cl
+            LEFT JOIN "Collectors" c ON c."CollectorID" = cl."CollectorID"
+            WHERE cl."Locality1ID" = $1 AND cl."CollectorID" IS NOT NULL
+            ORDER BY cl."CollectorLocalityID"
+            ''',
+            locality_id,
+        )
 
         return {
             "code": 20000,
             "data": {
                 "items": result,
+                "collectors": collectors,
                 "total": 1
             }
         }
     except Exception as e:
         return {
             "code": 50000,
-            "message": f"Failed to get locality details: {str(e)}"
+            "data": {"message": f"Failed to get locality details: {str(e)}"}
         }
