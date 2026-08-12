@@ -11,7 +11,6 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation, execute_transaction
-from app.services.es_sync import handle_data_change
 from app.services.taxon_reference_check import (
     family_reference_warning, family_suggestion_warning, store_warnings,
     apply_family_checks,
@@ -2615,10 +2614,6 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
                     'INSERT INTO "Family" ("FamilyName", created_at, created_via) '
                     'VALUES ($1, NOW(), $2) RETURNING "FamilyID"', family, "cof_import")
                 family_id = ins[0]["FamilyID"]
-                try:
-                    await handle_data_change("Family", family_id, "INSERT")
-                except Exception:
-                    pass  # ES sync is best-effort; never block the create
 
         # 2. find-or-create TaxonomicTable taxon
         full_name = " ".join(x for x in [genus, species, subspecies] if x)
@@ -2635,10 +2630,6 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
                 'VALUES ($1,$2,$3,$4,$5, NOW(), $6) RETURNING "TaxonID"',
                 family_id, genus, species, subspecies, full_name, "cof_import")
             taxon_id = ins[0]["TaxonID"]
-            try:
-                await handle_data_change("TaxonomicTable", taxon_id, "INSERT")
-            except Exception:
-                pass  # ES sync is best-effort; never block the create
 
         # 3. assign to the record + mark species verified, refresh family warnings
         await execute_mutation(
@@ -2710,7 +2701,6 @@ async def apply_family_taxon(record_id: int, payload: ApplyFamilyTaxonModel):
             taxon_id = insert_result[0]["TaxonID"]
             full_scientific_name = family_name
             was_created = True
-            await handle_data_change("TaxonomicTable", taxon_id, "INSERT")
 
         # 4. 应用到 primary_temp
         apply_query = """

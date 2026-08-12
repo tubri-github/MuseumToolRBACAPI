@@ -1,12 +1,12 @@
 from datetime import datetime, date
 
+import asyncpg
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_paginated_query_with_count, execute_transaction, get_db
-from app.services.es_sync import handle_data_change
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 from app.services.synonym_service import SynonymService
 
@@ -492,8 +492,6 @@ async def deaccession(data: DeaccessionModel):
 
         await execute_mutation(query2, updated_total, data.primaryID)
 
-        # Sync the updated data to Elasticsearch
-        await handle_data_change("Primary", data.primaryID, "UPDATE")
 
         return {
             "code": 20000,
@@ -717,18 +715,50 @@ SUB_LOT_COLLECTIONS = {"osteology", "tissue"}
 
 
 def _normalize_determinations(zdet) -> list:
-    """把前端 zDetermination 规整成统一结构(root 和子节点共用)。"""
+    """把前端 zDetermination 规整成统一结构(root 和子节点共用)。
+
+    跳过完全空的行 —— 表单默认就带一行 isCurrent=true 但 taxon 为空的鉴定,以前照插不误,
+    于是每个没选 taxon 就保存的 lot 都会多出一条 IsCurrent=true / TaxonID=NULL 的垃圾鉴定。
+    后果:lots 搜索是经 Determination(IsCurrent) 连 taxon 名的,这种 lot 搜出来没有分类名;
+    等策展人事后补上真正的鉴定,同一条记录就有两条 IsCurrent=true,当前鉴定变得不确定。
+    (preparation 一直是跳过空行的,这里之前漏了。)
+    """
     out = []
     for det in (zdet or []):
-        out.append({
+        row = {
             "isCurrent": det.get("isCurrent", False),
             "taxonId": det.get("taxonId") or None,
             "determinerID": (det.get("determination", {}) or {}).get("determinerID") or None,
             "determinerName": (det.get("determination", {}) or {}).get("determinerName") or None,
             "date": det.get("date") or None,
             "remarks": det.get("remarks") or None,
-        })
+        }
+        # isCurrent 不算“有内容”:它默认就是 true,不能靠它判断这行是不是真填了东西
+        if not any(row[k] for k in ("taxonId", "determinerID", "determinerName", "date", "remarks")):
+            continue
+        out.append(row)
     return out
+
+
+def _opt_int(v):
+    """空 -> None,但 **0 要保留**。
+    原来到处写 `x if x else None`,0 是 falsy,于是 TotalNumber=0(整批已退还/销毁)会被悄悄存成 NULL。"""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cataloged_date(dt):
+    """DateCataloged 归一成"当天零点"的 naive datetime。
+    前端 date-picker 不带 value-format 时发的是带 Z 的 ISO,pydantic 解析成 tz-aware;
+    root 走存储过程(参数是 date)会落成 00:00,子节点直接存则落成 05:00 —— 同一天建的父子记录
+    日期字段长得不一样。这里统一只取日期部分。"""
+    if dt is None:
+        return None
+    return datetime(dt.year, dt.month, dt.day)
 
 
 def _normalize_preparations(preps) -> list:
@@ -772,15 +802,15 @@ async def new_lot(data: LotModel):
             "add_lot_procedure",
             data.scientificName,
             data.prevNumber,
-            data.dateCataloged if data.dateCataloged else None,
+            _cataloged_date(data.dateCataloged),
             data.jarSize,
             data.storage,
             data.typeStatus,
             data.inventory,
             data.remarks,
-            data.localityId if data.localityId else None,
-            data.catalogerId if data.catalogerId else None,
-            data.totalNumber if data.totalNumber else None,
+            _opt_int(data.localityId),
+            _opt_int(data.catalogerId),
+            _opt_int(data.totalNumber),   # 0 是合法的标本数,别被当成"没填"
             determinations,
             preparations,
             collection
@@ -800,7 +830,20 @@ async def new_lot(data: LotModel):
 
     except HTTPException:
         raise  # 让 400(collection 校验等)原样透出，别被下面吞成 500
+    except asyncpg.exceptions.UniqueViolationError as e:
+        # catalog 号是 MAX+1 且没加锁，两个人同时建 root lot 会算出同一个号，
+        # 靠 Primary_CatalogNumber_key 挡住。翻译成人话，别把 Postgres 原文丢给策展人。
+        print(f"Catalog number collision while creating a lot: {e}")
+        raise HTTPException(
+            status_code=409,
+            detail="Catalog number was taken by another record just now. Please submit again.")
+    except asyncpg.exceptions.ForeignKeyViolationError as e:
+        print(f"FK violation while creating a lot: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail="A referenced record (locality, cataloger or taxon) no longer exists.")
     except Exception as e:
+        print(f"Error creating lot: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -823,9 +866,11 @@ async def _create_sub_lot(data: "LotModel", determinations: list, preparations: 
     if (parent[0].get("collection") or "") == "image":
         raise HTTPException(status_code=400, detail="image is a voucher leaf and cannot have sub-records")
 
-    ident = await _next_collection_identifier(COLLECTION_PREFIX[coll])
     async with get_db() as conn:
         async with conn.transaction():
+            # 算号必须和插入在同一事务里（内部会取 advisory lock）：
+            # 以前在事务外先算好再进来插，两个并发请求会拿到同一个 identifier。
+            ident = await _next_collection_identifier(COLLECTION_PREFIX[coll], conn)
             # CatalogNumber 显式 NULL(子节点用 identifier);DateCataloged 列是 date,
             # data.dateCataloged 是 datetime(date 的子类)asyncpg 可直接编码。
             pid = await conn.fetchval(
@@ -835,14 +880,14 @@ async def _create_sub_lot(data: "LotModel", determinations: list, preparations: 
                 ' "CatalogerID", "TotalNumber") '
                 'VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING "PrimaryID"',
                 data.parentId, coll, ident,
-                # DateCataloged 列是 timestamp；前端带 Z(tz-aware),asyncpg 编码会和 naive 纪元相减报错。
-                # 去掉时区转 naive(只关心日期);root 走存储过程(date 参数)不受影响。
                 data.prevNumber,
-                data.dateCataloged.replace(tzinfo=None) if data.dateCataloged else None,
+                # DateCataloged 列是 timestamp。和 root 用同一个归一化(只取日期,零点),
+                # 否则同一天建的父子记录一个 00:00 一个 05:00。
+                _cataloged_date(data.dateCataloged),
                 data.jarSize, data.storage, data.typeStatus, data.inventory, data.remarks,
-                data.localityId if data.localityId else None,
-                data.catalogerId if data.catalogerId else None,
-                data.totalNumber if data.totalNumber else None,
+                _opt_int(data.localityId),
+                _opt_int(data.catalogerId),
+                _opt_int(data.totalNumber),
             )
             for det in determinations:
                 # Date1 来自原始 dict(字符串/None),用 ::text::date 兼容字符串日期。
@@ -957,14 +1002,27 @@ async def get_lots_numbers_by_year(year: str):
 COLLECTION_PREFIX = {"osteology": "OST", "tissue": "TIS", "image": "IMG"}
 
 
-async def _next_collection_identifier(prefix: str) -> str:
-    """下一个 PREFIX-n 标识号（每个前缀独立递增）。低并发场景用 MAX+1。"""
-    rows = await execute_query(
-        "SELECT COALESCE(MAX(CAST(substring(identifier from '[0-9]+$') AS INTEGER)), 0) + 1 AS n "
-        'FROM "Primary" WHERE identifier ~ $1',
-        f'^{prefix}-[0-9]+$',
-    )
-    return f"{prefix}-{rows[0]['n']}"
+async def _next_collection_identifier(prefix: str, conn=None) -> str:
+    """下一个 PREFIX-n 标识号（每个前缀独立递增）。
+
+    必须在**调用方的事务里**执行(传 conn),并先取 advisory lock：算号是 MAX+1,
+    以前在事务外裸跑,两个并发请求会算出同一个号,而 identifier 当时没有唯一约束,
+    两条重号记录会双双写进去且不报错。现在:
+      ① advisory lock 让同一 prefix 的"算号+插入"串行,正常情况下不会撞;
+      ② uq_primary_identifier 唯一索引兜底(migrations/add_primary_identifier_unique.sql)。
+    lock 随事务提交自动释放。
+    """
+    sql = ("SELECT COALESCE(MAX(CAST(substring(identifier from '[0-9]+$') AS INTEGER)), 0) + 1 AS n "
+           'FROM "Primary" WHERE identifier ~ $1')
+    pattern = f'^{prefix}-[0-9]+$'
+    if conn is None:
+        # 没有事务上下文时退回旧行为（只有唯一索引兜底）。正常路径都应该传 conn。
+        rows = await execute_query(sql, pattern)
+        return f"{prefix}-{rows[0]['n']}"
+    # 每个 prefix 一把锁；hashtext 把前缀映射成 lock key
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"collection_identifier:{prefix}")
+    n = await conn.fetchval(sql, pattern)
+    return f"{prefix}-{n}"
 
 
 class SubRecordModel(BaseModel):

@@ -1,6 +1,7 @@
 # app/middleware/optimized_request_logging.py
 import json
 import time
+import traceback
 import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -25,7 +26,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             backup_count: int = 10,
             exclude_paths: list = None,
             log_format: str = "json",  # "json" or "text"
-            log_request_body: bool = False  # 是否记录请求体
+            log_request_body: bool = False,  # 是否对**所有**请求记录请求体（有性能代价）
+            log_body_on_error: bool = True,  # 只在 4xx/5xx 时记录请求体+响应体（排障用，代价很小）
+            max_body_bytes: int = 64 * 1024  # 超过这个大小不缓冲（跳过文件上传）
     ):
         super().__init__(app)
         self.log_dir = Path(log_dir)
@@ -34,6 +37,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         self.exclude_paths = exclude_paths or ["/docs", "/redoc", "/openapi.json", "/favicon.ico", "/metrics"]
         self.log_format = log_format
         self.log_request_body = log_request_body
+        self.log_body_on_error = log_body_on_error
+        self.max_body_bytes = max_body_bytes
 
         # 确保日志目录存在
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -99,9 +104,13 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # 收集基础请求信息（不读取请求体）
         request_data = self._collect_basic_request_data(request, request_id)
 
-        # 如果需要记录请求体，使用特殊方法处理
-        if self.log_request_body and request.method in ["POST", "PUT", "PATCH"]:
-            request_data["body"] = await self._safely_read_request_body(request)
+        # 请求体：要么全量记录(log_request_body)，要么先缓冲着、只有出错时才写进日志
+        # (log_body_on_error)。缓冲后必须把 body 重新塞回去，否则下游读不到。
+        buffered_body = None
+        if request.method in ["POST", "PUT", "PATCH"] and (self.log_request_body or self.log_body_on_error):
+            buffered_body = await self._buffer_request_body(request)
+            if self.log_request_body and buffered_body is not None:
+                request_data["body"] = self._redact(buffered_body)
 
         # 执行请求
         try:
@@ -109,10 +118,26 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
             # 收集响应信息
             processing_time = time.time() - start_time
+
+            # 4xx/5xx：把请求体和响应体一起记下来。以前只有"未处理异常"才算错误，
+            # 而 FastAPI 把 HTTPException(500) 转成正常响应返回 —— call_next 不抛异常，
+            # 于是 errors.log 里根本没有这些 500，排障时等于什么都没记。
+            error_data = None
+            if response.status_code >= 400:
+                response_body = await self._capture_response_body(response)
+                response = self._rebuild_response(response, response_body)
+                error_data = {
+                    "error_type": f"HTTP_{response.status_code}",
+                    "error_message": self._decode(response_body),
+                    "status_code": response.status_code,
+                }
+                if buffered_body is not None:
+                    error_data["request_body"] = self._redact(buffered_body)
+
             response_data = self._collect_response_data(response, processing_time)
 
             # 异步记录日志（不阻塞响应）
-            asyncio.create_task(self._log_request(request_data, response_data, None))
+            asyncio.create_task(self._log_request(request_data, response_data, error_data))
 
             return response
 
@@ -122,8 +147,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             error_data = {
                 "error_type": type(e).__name__,
                 "error_message": str(e),
+                "traceback": traceback.format_exc()[-4000:],
                 "status_code": 500
             }
+            if buffered_body is not None:
+                error_data["request_body"] = self._redact(buffered_body)
 
             response_data = {
                 "status_code": 500,
@@ -166,23 +194,90 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             "device": browser_info["device"]
         }
 
-    async def _safely_read_request_body(self, request: Request) -> str:
-        """安全地读取请求体"""
+    # 请求体里不该进日志的字段（大小写不敏感）
+    _SENSITIVE_KEYS = ("password", "passwd", "token", "secret", "authorization", "api_key")
+
+    async def _buffer_request_body(self, request: Request) -> Optional[bytes]:
+        """读出请求体并**重新塞回去**，否则下游 endpoint 会读到空 body。
+        跳过文件上传和超大请求（排障要的是表单 JSON，不是几十 MB 的 xlsx）。"""
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            return None
         try:
-            # 检查是否已经读取过
-            if hasattr(request.state, 'body'):
-                return request.state.body
+            length = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            length = 0
+        if length > self.max_body_bytes:
+            return None
+        try:
+            body = await request.body()
+        except Exception:
+            return None
+        if len(body) > self.max_body_bytes:
+            return None
 
-            # 读取请求体
-            body_bytes = await request.body()
-            body_str = body_bytes.decode("utf-8", errors="ignore")[:1000]  # 限制长度
+        # 把读走的字节重新提供给下游
+        async def receive() -> Message:
+            return {"type": "http.request", "body": body, "more_body": False}
 
-            # 保存到状态中
-            request.state.body = body_str
+        request._receive = receive
+        return body
 
-            return body_str
-        except Exception as e:
-            return f"Error reading body: {str(e)}"
+    async def _capture_response_body(self, response: Response) -> bytes:
+        """把（出错的）响应体读出来，好把 detail 记进日志。仅在 4xx/5xx 时调用。"""
+        if hasattr(response, "body") and response.body is not None:
+            return bytes(response.body)
+        chunks = []
+        try:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode())
+                if sum(len(c) for c in chunks) > self.max_body_bytes:
+                    break
+        except Exception:
+            pass
+        return b"".join(chunks)
+
+    @staticmethod
+    def _rebuild_response(response: Response, body: bytes) -> Response:
+        """body_iterator 被读干了，要用同样的状态码/头重建一个可返回的响应。"""
+        if hasattr(response, "body") and response.body is not None:
+            return response
+        rebuilt = Response(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+        )
+        # Content-Length 由 Response 重新算，避免和原头里的值冲突
+        rebuilt.headers["content-length"] = str(len(body))
+        return rebuilt
+
+    @staticmethod
+    def _decode(body: bytes) -> str:
+        return body.decode("utf-8", errors="ignore")[:2000] if body else ""
+
+    def _redact(self, body: bytes) -> str:
+        """尽量按 JSON 结构打码敏感字段；不是 JSON 就原样截断。"""
+        text = self._decode(body)
+        if not text:
+            return ""
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return text
+
+        def scrub(node):
+            if isinstance(node, dict):
+                return {k: ("***" if any(s in k.lower() for s in self._SENSITIVE_KEYS) else scrub(v))
+                        for k, v in node.items()}
+            if isinstance(node, list):
+                return [scrub(x) for x in node]
+            return node
+
+        try:
+            return json.dumps(scrub(data), ensure_ascii=False)[:4000]
+        except (TypeError, ValueError):
+            return text
 
     def _collect_response_data(self, response: Response, processing_time: float) -> Dict[str, Any]:
         """收集响应数据"""
@@ -284,9 +379,13 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     "request_id": log_entry["request_id"],
                     "method": log_entry["method"],
                     "path": log_entry["path"],
+                    "query_params": log_entry.get("query_params"),
                     "client_ip": log_entry["client_ip"],
                     "error_type": error_data["error_type"],
                     "error_message": error_data["error_message"],
+                    # 出错时把提交上来的参数一并记下 —— 没有它，远端报错只能靠猜
+                    "request_body": error_data.get("request_body"),
+                    "traceback": error_data.get("traceback"),
                     "user_agent": log_entry["user_agent"]
                 }
                 self.error_logger.error(json.dumps(error_log, ensure_ascii=False))

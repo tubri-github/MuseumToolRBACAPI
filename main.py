@@ -28,7 +28,9 @@ app.add_middleware(
     backup_count=10,
     exclude_paths=["/docs", "/redoc", "/openapi.json", "/favicon.ico", "/metrics"],
     log_format="json",
-    log_request_body=False  # 设为False避免影响PUT请求性能
+    log_request_body=False,   # 不对所有请求记录 body（有性能代价）
+    log_body_on_error=True,   # 但 4xx/5xx 时把请求体+响应体记进 logs/errors.log，否则远端报错无从查起
+    max_body_bytes=64 * 1024  # 超过则跳过（文件上传不缓冲）
 )
 
 

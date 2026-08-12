@@ -3,7 +3,6 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation
-from app.services.es_sync import handle_data_change
 
 router = APIRouter()
 
@@ -236,8 +235,6 @@ async def update_ost(data: OSTModel):
             data.recordeddate
         )
 
-        # Sync the updated data to Elasticsearch
-        await handle_data_change("ostelogy", data.ostcatalog, "UPDATE")
 
         return {
             "code": 20000,

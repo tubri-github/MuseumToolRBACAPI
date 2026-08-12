@@ -385,21 +385,12 @@ class TaxonApplyService:
 
     @staticmethod
     async def _reindex(determination_ids: List[int]) -> tuple:
-        """Reindex lots docs for each new determination. Best-effort; returns (ok, errors)."""
-        try:
-            from app.services.es_sync import handle_data_change
-        except Exception as e:  # noqa: BLE001
-            logger.warning("es_sync unavailable: %s", e)
-            return (0, len(determination_ids))
-        ok = err = 0
-        for did in determination_ids:
-            try:
-                await handle_data_change("Determination", did, "INSERT")
-                ok += 1
-            except Exception as e:  # noqa: BLE001
-                err += 1
-                logger.warning("ES reindex failed for determination %s: %s", did, e)
-        return (ok, err)
+        """No-op: Elasticsearch is no longer used in this project.
+
+        Kept so callers keep their (ok, errors) contract. Search runs straight off the
+        database now, so applying a determination needs no reindex step.
+        """
+        return (len(determination_ids), 0)
 
     # ---- undo ------------------------------------------------------------------------------
 
@@ -453,20 +444,8 @@ class TaxonApplyService:
                 logger.exception("undo failed for apply_log %s", apply_log_id)
                 return {"error": f"undo failed: {e}"}
 
-        # reindex affected primaries from their (restored) current determination
-        ok = err = 0
-        try:
-            from app.services.es_sync import handle_data_change
-            for pid in primaries:
-                try:
-                    await handle_data_change("Primary", pid, "UPDATE")
-                    ok += 1
-                except Exception as e:  # noqa: BLE001
-                    err += 1
-                    logger.warning("ES reindex (undo) failed for primary %s: %s", pid, e)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("es_sync unavailable on undo: %s", e)
-
+        # 以前这里会把受影响的 primary 重新索引到 ES；ES 已停用，搜索直接走数据库，无需此步。
+        # 返回值里的 es_* 字段保留，避免调用方/前端因少字段报错。
         return {"apply_log_id": apply_log_id, "status": "undone",
                 "determinations_restored": len(retired), "determinations_removed": len(inserted),
-                "es_reindexed": ok, "es_errors": err}
+                "es_reindexed": len(primaries), "es_errors": 0}

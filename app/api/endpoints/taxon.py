@@ -3,7 +3,6 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation
-from app.services.es_sync import handle_data_change
 
 router = APIRouter()
 
@@ -244,7 +243,6 @@ async def new_taxon(data: TaxonModel):
         # Sync the new data to Elasticsearch
         if result and len(result) > 0:
             taxon_id = result[0]["TaxonID"]
-            await handle_data_change("TaxonomicTable", taxon_id, "INSERT")
 
         return {
             "code": 20000,

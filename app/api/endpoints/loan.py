@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field, validator
 
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_single_query, \
     execute_paginated_query_with_count
-from app.services.es_sync import handle_data_change
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 
 router = APIRouter()
@@ -422,8 +421,6 @@ async def new_loan(data: LoanModel):
             loan_details
         )
 
-        # Sync the updated data to Elasticsearch
-        await handle_data_change(f"t2", data.loanId, "INSERT")
 
         return {
             "code": 20000,

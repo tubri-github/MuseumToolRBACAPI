@@ -3,7 +3,6 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation
-from app.services.es_sync import handle_data_change
 
 router = APIRouter()
 

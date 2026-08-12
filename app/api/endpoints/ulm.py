@@ -3,7 +3,6 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation, execute_single_query
-from app.services.es_sync import handle_data_change
 
 router = APIRouter()
 
@@ -305,8 +304,6 @@ async def update_ulm_lot(data: ULMModel):
             data.reviewer
         )
 
-        # Sync the updated data to Elasticsearch
-        await handle_data_change("ulm_temp", data.PrimaryID, "UPDATE")
 
         return {
             "code": 20000,
