@@ -25,6 +25,11 @@ class CreateFamilyModel(BaseModel):
 class ResponseModel(BaseModel):
     code: int
     data: Dict[str, Any]
+    # Optional, but it has to be declared: response_model silently DROPS undeclared keys, so
+    # every "message" these endpoints already return -- create_family's "Family 'X' already
+    # exists" among them -- was being filtered out before it reached the client, which then
+    # showed the interceptor's generic "Error" instead.
+    message: Optional[str] = None
 
 
 @router.get("/taxons/{keyword}", response_model=ResponseModel)
@@ -187,6 +192,55 @@ async def get_family(keyword: str):
         "data": {
             "items": records,
             "total": len(records)
+        }
+    }
+
+
+@router.get("/{taxon_id}/family-history", response_model=ResponseModel)
+async def get_family_history(taxon_id: int):
+    """Every family this taxon has been filed under, newest change first.
+
+    A taxon's family is a single overwritten column -- "TaxonomicTable"."FamilyID" -- so the
+    table itself cannot answer "where did this used to sit". Copying the taxon row on every
+    reclassification would answer it, but at the price of duplicate FullScientificName rows,
+    and name resolution picks the lowest TaxonID among duplicates (taxon_apply_service) -- so
+    the copy would silently win or lose matches. The history lives in family_fix_audit instead,
+    written by both routes that can move a family:
+
+      reassign_op_id IS NULL -> fix_family_mismatch.py, the automatic 2026-06-10 pass
+      reassign_op_id SET     -> a curator moved it from the family-disagreement tab
+
+    Undone moves are kept and flagged rather than hidden: that a family was moved and moved
+    back is itself part of the record.
+    """
+    current = await execute_query(
+        'SELECT tt."TaxonID", tt."FullScientificName", tt."FamilyID", f."FamilyName" '
+        'FROM "TaxonomicTable" tt LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID" '
+        'WHERE tt."TaxonID" = $1', taxon_id)
+    if not current:
+        return {"code": 40400, "data": {}, "message": f"Taxon {taxon_id} not found"}
+
+    changes = await execute_query(
+        'SELECT a.id, a.run_at AS changed_at, a.category, '
+        '       a.old_family_id, a.old_family_name, a.new_family_id, a.new_family_name, '
+        '       a.created_new_family, a.usage_count AS specimens_at_the_time, '
+        '       a.reassign_op_id, '
+        '       COALESCE(a.performed_by, o.performed_by) AS changed_by, '
+        '       COALESCE(o.status, $2) AS status, o.undone_at, o.undone_by, o.note '
+        'FROM family_fix_audit a '
+        'LEFT JOIN family_reassign_op o ON o.id = a.reassign_op_id '
+        'WHERE a.taxon_id = $1 '
+        'ORDER BY a.run_at DESC, a.id DESC', taxon_id, "applied")
+
+    return {
+        "code": 20000,
+        "data": {
+            "taxon_id": current[0]["TaxonID"],
+            "full_name": current[0]["FullScientificName"],
+            "current_family_id": current[0]["FamilyID"],
+            "current_family": current[0]["FamilyName"],
+            "changes": changes,
+            "total": len(changes),
         }
     }
 

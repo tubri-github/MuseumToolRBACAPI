@@ -6,8 +6,11 @@ whole museum instead of being re-confirmed on every batch record. See
 app/services/family_policy_service.py for why, and migrations/family_reference_policy.sql
 for the numbers that motivated it.
 
-Kept as its own router (not folded into synonym-review) because it is a different object:
-these endpoints only read/write rulings, they never edit taxonomy.
+The /reassign endpoints are the exception and are marked as such: they DO edit taxonomy
+(TaxonomicTable."FamilyID"), because "neither our family nor the Catalog's is right" cannot be
+answered by recording an opinion. They live here anyway -- the curator reaches them from the
+same disagreement row, and splitting them off would only make that one decision span two APIs.
+See app/services/family_reassign_service.py.
 """
 from typing import Any, Dict, List, Optional
 
@@ -15,9 +18,11 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.services.family_policy_service import FamilyPolicyService
+from app.services.family_reassign_service import FamilyReassignService
 
 router = APIRouter()
 service = FamilyPolicyService()
+reassign_service = FamilyReassignService()
 
 
 class ResponseModel(BaseModel):
@@ -125,3 +130,103 @@ async def revoke_ruling(ruling_id: int, body: RevokeModel):
                              message="Ruling revoked; this pair will warn again")
     except Exception as e:  # noqa: BLE001
         return ResponseModel(code=50000, message=f"Failed to revoke ruling: {e}")
+
+
+# ---------------------------------------------------------------------------------------
+# Reassignment: the "neither is right" answer. These change data.
+# ---------------------------------------------------------------------------------------
+
+class ReassignModel(BaseModel):
+    taxon_ids: List[int]
+    # Exactly one of the two: an existing family, or a name to create.
+    target_family_id: Optional[int] = None
+    target_family_name: Optional[str] = None
+    # The disagreement row the curator came from -- context for the history list only.
+    source_local_family: Optional[str] = None
+    source_reference_family: Optional[str] = None
+    note: Optional[str] = None
+    performed_by: str
+
+
+class UndoReassignModel(BaseModel):
+    undone_by: str
+
+
+@router.post("/reassign/preview", response_model=ResponseModel)
+async def preview_reassign(body: ReassignModel):
+    """What the move would do -- including which taxa are already in the target family, and
+    which NEW disagreements it would create and silence on the curator's behalf."""
+    try:
+        result = await reassign_service.preview(
+            body.taxon_ids, body.target_family_id, body.target_family_name)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        return ResponseModel(code=20000, data=result)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to preview the move: {e}")
+
+
+@router.post("/reassign", response_model=ResponseModel)
+async def reassign(body: ReassignModel):
+    """Move the selected taxa to the chosen family.
+
+    Writes TaxonomicTable."FamilyID" and nothing else; "Determination" is untouched, so no
+    specimen is re-identified. Every taxon's previous family is recorded in family_fix_audit
+    and the whole action is undoable.
+    """
+    try:
+        result = await reassign_service.reassign(
+            taxon_ids=body.taxon_ids,
+            performed_by=body.performed_by,
+            target_family_id=body.target_family_id,
+            target_family_name=body.target_family_name,
+            source_local_family=body.source_local_family,
+            source_reference_family=body.source_reference_family,
+            note=body.note)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        msg = (f"{result['taxa_moved']} taxa moved to {result['target_family_name']}"
+               f"{' (family created)' if result['target_family_created'] else ''}")
+        if result["rulings_created"]:
+            msg += f"; {len(result['rulings_created'])} follow-up warning(s) silenced"
+        return ResponseModel(code=20000, data=result, message=msg)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to move the taxa: {e}")
+
+
+@router.get("/reassign/history", response_model=ResponseModel)
+async def reassign_history(limit: int = Query(50, ge=1, le=500)):
+    """Past moves, newest first. Undone ones stay in the list -- who moved what, and when,
+    is part of the record."""
+    try:
+        rows = await reassign_service.history(limit)
+        return ResponseModel(code=20000, data={"items": rows, "total": len(rows)})
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to list family moves: {e}")
+
+
+@router.get("/reassign/{op_id}/taxa", response_model=ResponseModel)
+async def reassign_taxa(op_id: int):
+    """The per-taxon before/after of one move, from family_fix_audit."""
+    try:
+        rows = await reassign_service.operation_taxa(op_id)
+        return ResponseModel(code=20000, data={"items": rows, "total": len(rows)})
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to list the moved taxa: {e}")
+
+
+@router.post("/reassign/{op_id}/undo", response_model=ResponseModel)
+async def undo_reassign(op_id: int, body: UndoReassignModel):
+    """Put every taxon in this move back into the family it came from.
+
+    Refused if any of them has been moved again since -- restoring would silently overwrite a
+    later decision.
+    """
+    try:
+        result = await reassign_service.undo(op_id, body.undone_by)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        return ResponseModel(code=20000, data=result,
+                             message=f"Move undone: {result['taxa_restored']} taxa restored")
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to undo the move: {e}")
