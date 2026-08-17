@@ -32,6 +32,9 @@ class CreateCofTaxonModel(BaseModel):
     species: str
     subspecies: Optional[str] = None
     family: Optional[str] = None
+    # Who pressed it. This button writes to the museum's taxonomy, not to staging, so the
+    # audit row is the only way to answer "where did this taxon come from" afterwards.
+    created_by: Optional[str] = None
 
 # Pydantic models
 class ResponseModel(BaseModel):
@@ -2833,6 +2836,65 @@ async def apply_taxonomic_suggestion(record_id: int,
         )
 
 
+async def _find_cof_taxon_and_family(genus: str, species: str, subspecies: Optional[str],
+                                     family: Optional[str]):
+    """Look up what already exists locally for a CoF suggestion, without creating anything.
+
+    Shared by the preview and the create path so the dialog cannot promise one thing and the
+    button do another.
+    """
+    family_id = family_name = None
+    if family:
+        fr = await execute_query(
+            'SELECT "FamilyID", "FamilyName" FROM "Family" '
+            'WHERE lower("FamilyName") = lower($1) LIMIT 1', family)
+        if fr:
+            family_id, family_name = fr[0]["FamilyID"], fr[0]["FamilyName"]
+
+    find = await execute_query(
+        'SELECT "TaxonID", "FullScientificName" FROM "TaxonomicTable" '
+        'WHERE lower("Genus") = lower($1) AND lower("Species") = lower($2) '
+        'AND lower(COALESCE("Subspecies", \'\')) = lower($3) '
+        'ORDER BY "TaxonID" LIMIT 1', genus, species, subspecies or "")
+    taxon_id = find[0]["TaxonID"] if find else None
+    taxon_name = find[0]["FullScientificName"] if find else None
+    return {"taxon_id": taxon_id, "taxon_name": taxon_name,
+            "family_id": family_id, "family_name": family_name}
+
+
+@router.post("/records/{record_id}/create-cof-taxon/preview", response_model=ResponseModel)
+async def preview_create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
+    """What pressing "Create & apply" would actually add to the museum's taxonomy.
+
+    Exists so the confirmation can name the consequence instead of describing it vaguely:
+    creating a FAMILY is a much bigger step than reusing one that is already there, and until
+    the lookup runs neither the curator nor the UI knows which of the two is about to happen.
+    """
+    try:
+        genus = (payload.genus or "").strip()
+        species = (payload.species or "").strip()
+        subspecies = (payload.subspecies or "").strip() or None
+        family = (payload.family or "").strip() or None
+        if not genus or not species:
+            return ResponseModel(code=40000, message="genus and species are required")
+
+        found = await _find_cof_taxon_and_family(genus, species, subspecies, family)
+        full_name = " ".join(x for x in [genus, species, subspecies] if x)
+        return ResponseModel(code=20000, data={
+            "full_name": full_name,
+            "family": family,
+            "taxon_exists": found["taxon_id"] is not None,
+            "existing_taxon_id": found["taxon_id"],
+            "existing_taxon_name": found["taxon_name"],
+            "family_exists": found["family_id"] is not None or not family,
+            "existing_family_id": found["family_id"],
+            "will_create_taxon": found["taxon_id"] is None,
+            "will_create_family": bool(family) and found["family_id"] is None,
+        })
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to preview: {str(e)}")
+
+
 @router.post("/records/{record_id}/create-cof-taxon", response_model=ResponseModel)
 async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
     """Create the CoF-suggested taxon (find-or-create Family + TaxonomicTable, tagged
@@ -2846,8 +2908,18 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
         if not genus or not species:
             return ResponseModel(code=40000, message="genus and species are required")
 
+        # what the record looked like before, for the audit row
+        before = await execute_query(
+            'SELECT p."TaxonID", p.species_verification_status, p.batch_serial_id, '
+            "       vt.verbatim_genus, vt.verbatim_species "
+            "FROM primary_temp p "
+            'LEFT JOIN verbatim_taxonomic vt ON vt."verbatim_taxonid" = p."verbatim_taxonid" '
+            'WHERE p."PrimaryID" = $1', record_id)
+        prev = dict(before[0]) if before else {}
+
         # 1. find-or-create Family
         family_id = None
+        family_created = False
         if family:
             fr = await execute_query(
                 'SELECT "FamilyID" FROM "Family" WHERE lower("FamilyName") = lower($1) LIMIT 1', family)
@@ -2858,9 +2930,11 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
                     'INSERT INTO "Family" ("FamilyName", created_at, created_via) '
                     'VALUES ($1, NOW(), $2) RETURNING "FamilyID"', family, "cof_import")
                 family_id = ins[0]["FamilyID"]
+                family_created = True
 
         # 2. find-or-create TaxonomicTable taxon
         full_name = " ".join(x for x in [genus, species, subspecies] if x)
+        taxon_created = False
         find = await execute_query(
             'SELECT "TaxonID" FROM "TaxonomicTable" WHERE lower("Genus") = lower($1) '
             'AND lower("Species") = lower($2) AND lower(COALESCE("Subspecies", \'\')) = lower($3) '
@@ -2874,6 +2948,7 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
                 'VALUES ($1,$2,$3,$4,$5, NOW(), $6) RETURNING "TaxonID"',
                 family_id, genus, species, subspecies, full_name, "cof_import")
             taxon_id = ins[0]["TaxonID"]
+            taxon_created = True
 
         # 3. assign to the record + mark species verified, refresh family warnings
         await execute_mutation(
@@ -2881,11 +2956,80 @@ async def create_cof_taxon(record_id: int, payload: CreateCofTaxonModel):
             '"TimeStampModified" = NOW() WHERE "PrimaryID" = $2', taxon_id, record_id)
         await apply_family_checks(record_id, taxon_id)
 
+        # 4. Leave a trace. This is the one action in batch review that writes to the MUSEUM
+        # taxonomy rather than to staging, it is not undoable (removing a taxon cascades to
+        # "Determination"), and the rows it adds enter the matcher's reference immediately --
+        # so afterwards there has to be a way to answer "where did this taxon come from".
+        # Best-effort: the taxonomy write above already succeeded and must not be reported as
+        # failed because the log insert did not.
+        try:
+            await execute_mutation(
+                "INSERT INTO cof_taxon_creation_log "
+                "(record_id, batch_serial_id, verbatim_genus, verbatim_species, "
+                " cof_genus, cof_species, cof_subspecies, cof_family, "
+                " taxon_id, taxon_name, taxon_created, family_id, family_name, family_created, "
+                " previous_taxon_id, previous_species_status, created_by) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+                record_id, prev.get("batch_serial_id"), prev.get("verbatim_genus"),
+                prev.get("verbatim_species"), genus, species, subspecies, family,
+                taxon_id, full_name, taxon_created, family_id, family, family_created,
+                prev.get("TaxonID"), prev.get("species_verification_status"),
+                (payload.created_by or "")[:120] or None)
+        except Exception as log_err:  # noqa: BLE001
+            print(f"[cof-create] audit log failed for record {record_id}: {log_err}")
+
+        print(f"[cof-create] record {record_id} by {payload.created_by or '?'}: "
+              f"taxon {taxon_id} '{full_name}' "
+              f"({'CREATED' if taxon_created else 'reused existing'})"
+              + (f", family {family_id} '{family}' CREATED" if family_created else ""))
+
         return ResponseModel(code=20000, data={
             "taxon_id": taxon_id, "family_id": family_id, "full_name": full_name,
-            "message": f"Created and applied '{full_name}'"})
+            "taxon_created": taxon_created, "family_created": family_created,
+            "message": (f"Created and applied '{full_name}'" if taxon_created
+                        else f"Applied existing '{full_name}'")})
     except Exception as e:
         return ResponseModel(code=50000, message=f"Failed to create CoF taxon: {str(e)}")
+
+
+@router.get("/cof-taxon-log", response_model=ResponseModel)
+async def cof_taxon_log(
+    batch_serial_id: Optional[str] = Query(None),
+    created_only: bool = Query(False, description="only entries that ADDED a taxon or family"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Everything "Create & apply" has put into the museum taxonomy, newest first.
+
+    `created_only` separates the permanent additions from the presses that merely reused a row
+    that already existed -- only the former changed the taxonomy.
+    """
+    try:
+        where = ["1=1"]
+        params: List[Any] = []
+        if batch_serial_id:
+            params.append(batch_serial_id)
+            where.append(f"l.batch_serial_id = ${len(params)}")
+        if created_only:
+            where.append("(l.taxon_created OR l.family_created)")
+        params.append(limit)
+        rows = await execute_query(
+            "SELECT l.*, "
+            "  (SELECT count(*) FROM \"Determination\" d WHERE d.\"TaxonID\" = l.taxon_id) "
+            "    AS determinations_now, "
+            '  (SELECT count(*) FROM primary_temp p WHERE p."TaxonID" = l.taxon_id) '
+            "    AS staged_records_now "
+            "FROM cof_taxon_creation_log l "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY l.created_at DESC LIMIT ${len(params)}", *params)
+        return ResponseModel(code=20000, data={
+            "items": [dict(r) for r in rows],
+            "total": len(rows),
+            # what a manual clean-up would be up against: a taxon with determinations cannot
+            # simply be deleted (the FK cascades and would take the identifications with it)
+            "note": "Not undoable automatically: deleting a taxon cascades to Determination.",
+        })
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to read the log: {e}")
 
 
 @router.post("/records/{record_id}/apply-family-taxon", response_model=ResponseModel)
