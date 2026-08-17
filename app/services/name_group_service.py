@@ -191,7 +191,8 @@ class NameGroupService:
 
     @staticmethod
     async def _affected(batch_serial_id: str, name_key: str, taxon_id: int,
-                        whole_name: bool = False) -> List[Dict]:
+                        whole_name: bool = False,
+                        include_ids: Optional[List[int]] = None) -> List[Dict]:
         """The species-pending records this apply would touch.
 
         By default this is restricted to records whose own suggestion IS the taxon being
@@ -204,14 +205,29 @@ class NameGroupService:
         records and the "apply to the other 1357 too" offer would silently do nothing. It also
         happens to be the right repair when the importer answered one spelling inconsistently
         -- one imported name IS one identification, so making them agree is the point.
+
+        `include_ids` forces specific records into the set whatever their status. This is the
+        record the curator is deciding in the editor right now: it used to be written by its
+        own PUT a second before this call, which left it OUT of the group's prev_state, so
+        undo could not restore it -- the group shrank by one record per undo/re-apply cycle
+        and the undone answer stayed on that one record. It is passed here INSTEAD of being
+        written separately, so its true pre-decision state is what lands in prev_state.
         """
         # $3 is only bound when the clause that uses it is present -- asyncpg rejects a
         # parameter the statement never references.
         params: List[Any] = [batch_serial_id, (name_key or "").strip().lower()]
-        suggestion_clause = ""
+        selector = PENDING_SQL
         if not whole_name:
             params.append(taxon_id)
-            suggestion_clause = "AND vt.matched_taxon_id = $3"
+            selector = f"vt.matched_taxon_id = $3 AND {selector}"
+        ids = [int(i) for i in (include_ids or [])]
+        if ids:
+            params.append(ids)
+            # the forced records bypass BOTH filters: the one being decided may already be
+            # verified (the curator is changing their mind) and may carry a different
+            # suggestion than the answer they picked
+            selector = f'(({selector}) OR p."PrimaryID" = ANY(${len(params)}::int[]))'
+        suggestion_clause = ""  # folded into `selector` above
         return await execute_query(
             'SELECT p."PrimaryID", p."TaxonID" AS old_taxon_id, '
             "       coalesce(p.species_verification_status, 'pending') AS old_species, "
@@ -225,12 +241,13 @@ class NameGroupService:
             "FROM primary_temp p "
             "JOIN verbatim_taxonomic vt ON vt.verbatim_taxonid = p.verbatim_taxonid "
             f"WHERE p.batch_serial_id = $1 AND {NAME_KEY_SQL} = $2 "
-            f"  {suggestion_clause} AND {PENDING_SQL} "
+            f"  {suggestion_clause} AND {selector} "
             'ORDER BY p."PrimaryID"',
             *params)
 
     async def preview(self, batch_serial_id: str, name_key: str,
-                      taxon_id: int, whole_name: bool = False) -> Dict[str, Any]:
+                      taxon_id: int, whole_name: bool = False,
+                      include_ids: Optional[List[int]] = None) -> Dict[str, Any]:
         """What applying this group would do, before it is done.
 
         The family reference check is the part worth previewing: when it disagrees the
@@ -246,7 +263,8 @@ class NameGroupService:
         if not taxon:
             return {"error": f"taxon {taxon_id} not found"}
 
-        records = await self._affected(batch_serial_id, name_key, taxon_id, whole_name)
+        records = await self._affected(batch_serial_id, name_key, taxon_id, whole_name,
+                                       include_ids)
         ref_warning = await family_reference_warning(taxon_id)
 
         # The suggestion warning varies with the record's own imported family, so it is
@@ -275,12 +293,14 @@ class NameGroupService:
     # ---- apply ---------------------------------------------------------------------------
 
     async def apply(self, batch_serial_id: str, name_key: str, taxon_id: int,
-                    applied_by: str, whole_name: bool = False) -> Dict[str, Any]:
-        pre = await self.preview(batch_serial_id, name_key, taxon_id, whole_name)
+                    applied_by: str, whole_name: bool = False,
+                    include_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+        pre = await self.preview(batch_serial_id, name_key, taxon_id, whole_name, include_ids)
         if "error" in pre:
             return pre
 
-        records = await self._affected(batch_serial_id, name_key, taxon_id, whole_name)
+        records = await self._affected(batch_serial_id, name_key, taxon_id, whole_name,
+                                       include_ids)
         if not records:
             return {"error": "nothing to apply: no species-pending record in this batch "
                              + ("carries that name" if whole_name

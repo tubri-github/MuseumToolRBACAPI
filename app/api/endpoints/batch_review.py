@@ -2190,6 +2190,11 @@ class NameGroupApplyModel(BaseModel):
     # chose a different taxon, so nothing in the batch is matched to their answer and the
     # default filter would return nothing at all.
     whole_name: bool = False
+    # The record the curator is deciding in the editor right now. It joins this operation
+    # instead of being saved by its own PUT a moment earlier -- otherwise it is not in the
+    # group's prev_state and Undo cannot put it back, so every undo/re-apply cycle left one
+    # more record stranded on an answer the curator had already withdrawn.
+    include_record_ids: Optional[List[int]] = None
 
 
 class NameGroupUndoModel(BaseModel):
@@ -2216,7 +2221,7 @@ async def preview_name_group(batch_serial_id: str, body: NameGroupApplyModel):
     reference check will leave them pending anyway."""
     try:
         result = await name_groups.preview(batch_serial_id, body.name_key, body.taxon_id,
-                                           body.whole_name)
+                                           body.whole_name, body.include_record_ids)
         if "error" in result:
             return ResponseModel(code=40000, message=result["error"])
         return ResponseModel(code=20000, data=result)
@@ -2233,7 +2238,8 @@ async def apply_name_group(batch_serial_id: str, body: NameGroupApplyModel):
     """
     try:
         result = await name_groups.apply(batch_serial_id, body.name_key, body.taxon_id,
-                                         body.applied_by, body.whole_name)
+                                         body.applied_by, body.whole_name,
+                                         body.include_record_ids)
         if "error" in result:
             return ResponseModel(code=40000, message=result["error"])
         msg = f"{result['records_applied']} records set to {result['species_status']}"
