@@ -131,10 +131,11 @@ class DatabaseUtils:
         for record in records:
             insert_sql = """
             INSERT INTO verbatim_taxonomic (
-                "verbatim_family", "verbatim_genus", "verbatim_species", 
-                "match_status", "matched_taxon_id", "match_confidence", "match_details"
+                "verbatim_family", "verbatim_genus", "verbatim_species",
+                "match_status", "matched_taxon_id", "match_confidence", "match_details",
+                "historical_decision_id"
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7
+                $1, $2, $3, $4, $5, $6, $7, $8
             ) RETURNING "verbatim_taxonid"
             """
 
@@ -150,7 +151,10 @@ class DatabaseUtils:
                 record.get("match_status", "no_match"),
                 record.get("matched_taxon_id"),
                 record.get("match_confidence"),
-                match_details
+                match_details,
+                # set when the taxon came from a curator's decision on an earlier batch
+                # rather than from name matching (taxon_name_decision)
+                record.get("historical_decision_id")
             ]
 
             statements.append({

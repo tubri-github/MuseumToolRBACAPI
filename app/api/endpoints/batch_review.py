@@ -15,9 +15,12 @@ from app.services.taxon_reference_check import (
     family_reference_warning, family_suggestion_warning, store_warnings,
     apply_family_checks,
 )
+from app.services.name_decision_service import NameDecisionService
+from app.services.name_group_service import NameGroupService
 from app.utils.validation import ImportValidationUtils
 from app.utils.species_validation import SpeciesNameValidator
 router = APIRouter()
+name_groups = NameGroupService()
 
 
 class ApplyFamilyTaxonModel(BaseModel):
@@ -93,6 +96,14 @@ SEARCHABLE_FIELDS = {
     "verbatim_full_name": "(COALESCE(vt.\"verbatim_genus\",'') || ' ' || COALESCE(vt.\"verbatim_species\",''))",
     "matched_full_name": 't."FullScientificName"',
     "suggested_full_name": 'suggested_t."FullScientificName"',
+    # Records whose taxon was inherited from an earlier batch's decision rather than matched
+    # here. Filtered on the decision's id, not on decided_by: the signature can legitimately be
+    # blank (an apply with no curator name), and then __NOT_EMPTY__ on the name would hide
+    # exactly the pre-filled records it is meant to show. With __NOT_EMPTY__ this is the
+    # one-chip "show me everything pre-filled from history".
+    "historical_decision": 'nd."id"::text',
+    "historical_decided_by": 'nd."decided_by"',
+    "historical_source_batch": 'nd."source_batch"',
 }
 
 # 共享 JOIN：base_query 和 count_query 必须用同一份，避免出现一边引用了未 JOIN 的表的 bug
@@ -105,6 +116,7 @@ LEFT JOIN locality1 l ON p."Locality1ID" = l."Locality1ID"
 LEFT JOIN "TaxonomicTable" suggested_t ON vt."matched_taxon_id" = suggested_t."TaxonID"
 LEFT JOIN "Family" suggested_fam ON suggested_t."FamilyID" = suggested_fam."FamilyID"
 LEFT JOIN "Family" verbatim_fam ON LOWER(TRIM(vt."verbatim_family")) = LOWER(TRIM(verbatim_fam."FamilyName"))
+LEFT JOIN taxon_name_decision nd ON nd."id" = vt."historical_decision_id"
 """
 
 
@@ -153,6 +165,9 @@ class PrimaryRecordUpdateModel(BaseModel):
     locality_verification_status: Optional[str] = None
     record_verification_status: Optional[str] = None
     verification_notes: Optional[str] = None
+    # Who is making this edit. Only used when the edit verifies the species: the importer
+    # auto-verifies every exact match, so 'verified' on its own does not say a person looked.
+    verified_by: Optional[str] = None
 
 class BatchVerificationUpdateModel(BaseModel):
     record_ids: List[int]
@@ -500,6 +515,43 @@ async def get_batch_records(
             vt."matched_taxon_id",
             vt."match_confidence",
             vt."match_details",
+            -- who confirmed the name by hand; NULL means the importer matched it by itself
+            vt."verified_by_name",
+            vt."verified_at" as species_verified_at,
+            -- Set when the taxon was pre-filled from a decision a curator made on an EARLIER
+            -- batch (taxon_name_decision). The record is still pending on purpose: the answer
+            -- is filled in but nobody has confirmed it for this batch, and the row says whose
+            -- decision it is so a wrong one can be spotted instead of inherited.
+            vt."historical_decision_id",
+            nd."decided_by" as historical_decided_by,
+            nd."decided_at" as historical_decided_at,
+            nd."source_batch" as historical_source_batch,
+            nd."taxon_name" as historical_taxon_name,
+            -- How many OTHER records in this batch carry the same imported name and the same
+            -- suggestion and are still waiting. The importer does not deduplicate names, so
+            -- this is routinely in the hundreds -- Apply says so on the button instead of
+            -- making the curator find that out 1362 clicks later. Windowed, so it is one pass
+            -- over the batch rather than a query per row; LIMIT is applied after.
+            count(*) FILTER (
+                WHERE COALESCE(p."species_verification_status", 'pending') = 'pending'
+            ) OVER (
+                PARTITION BY btrim(regexp_replace(lower(
+                    COALESCE(vt."verbatim_genus", '') || ' ' ||
+                    COALESCE(vt."verbatim_species", '')), '\s+', ' ', 'g')),
+                    vt."matched_taxon_id"
+            ) as same_name_pending,
+            -- The same count WITHOUT the suggestion in the partition. The Apply button uses
+            -- the one above (it confirms the suggestion shown on the row); the record editor
+            -- uses this one, because there the curator may have replaced the suggestion
+            -- entirely and their answer applies to every record carrying the name, not just
+            -- the ones the importer happened to match the same way.
+            count(*) FILTER (
+                WHERE COALESCE(p."species_verification_status", 'pending') = 'pending'
+            ) OVER (
+                PARTITION BY btrim(regexp_replace(lower(
+                    COALESCE(vt."verbatim_genus", '') || ' ' ||
+                    COALESCE(vt."verbatim_species", '')), '\s+', ' ', 'g'))
+            ) as same_name_pending_any,
             vl."verbatim_locality_string",
             vl."verbatim_fieldno" as verbatim_field_number,
             vl."verbatim_drainage",
@@ -678,7 +730,14 @@ async def get_batch_records(
                 # 新增验证信息部分 - 这是唯一的添加
                 "verification_info": {
                     "species": {
-                        "status": record.get("species_verification_status", "pending")
+                        "status": record.get("species_verification_status", "pending"),
+                        # A 'verified' status alone does not say who decided: the importer
+                        # auto-verifies every exact match. These two are what separate a
+                        # curator's decision from that -- NULL means nobody looked. The key
+                        # names match what the table has been reading (and never receiving)
+                        # since it was written: VerbatimWorkspace's Species Status column.
+                        "verified_by_name": record.get("verified_by_name"),
+                        "verified_at": record.get("species_verified_at"),
                     },
                     "locality": {
                         "status": record.get("locality_verification_status", "pending")
@@ -692,6 +751,21 @@ async def get_batch_records(
                     "notes": record.get("verification_notes"),
                     "warnings": json.loads(record["verification_warnings"]) if record.get("verification_warnings") else []
                 },
+                # How many records this batch would settle in one go if the curator confirms
+                # this name -- see same_name_pending in the query above.
+                "same_name_pending": record.get("same_name_pending") or 0,
+                "same_name_pending_any": record.get("same_name_pending_any") or 0,
+                # Present only when the taxon was pre-filled from an earlier batch's decision.
+                # The row is still pending; this says who decided it and when, so the curator
+                # confirms an inherited answer knowingly rather than assuming the matcher
+                # found it.
+                "historical_decision": ({
+                    "id": record.get("historical_decision_id"),
+                    "decided_by": record.get("historical_decided_by"),
+                    "decided_at": record.get("historical_decided_at"),
+                    "source_batch": record.get("historical_source_batch"),
+                    "taxon_name": record.get("historical_taxon_name"),
+                } if record.get("historical_decision_id") else None),
                 "verbatim_data": {
                     "taxonomic": {
                         "id": record["verbatim_taxonid"],
@@ -1507,7 +1581,7 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
         # Verify the record exists - 只添加验证状态字段到查询
         check_query = """
         SELECT "PrimaryID", "CatalogNumber", "TaxonID", "Locality1ID", "review_flag",
-               "verbatim_localityid", "species_verification_status",
+               "verbatim_localityid", "verbatim_taxonid", "species_verification_status",
                "locality_verification_status", "record_verification_status"
         FROM primary_temp
         WHERE "PrimaryID" = $1
@@ -1617,6 +1691,38 @@ async def update_verbatim_record(record_id: int, update_data: PrimaryRecordUpdat
                 "PrimaryID": record_id,
                 "TimeStampModified": datetime.now()
             }]
+
+        # An edit that verifies the species is a person deciding, so stamp who -- the importer
+        # auto-verifies every exact match with the same status and the same "TaxonID", and
+        # without this the two are indistinguishable afterwards.
+        if (species_status == "verified"
+                and getattr(update_data, "verified_by", None)
+                and existing_record.get("verbatim_taxonid")):
+            await execute_mutation(
+                'UPDATE verbatim_taxonomic SET verified_by_name = $1, verified_at = NOW() '
+                'WHERE "verbatim_taxonid" = $2',
+                update_data.verified_by[:120], existing_record["verbatim_taxonid"])
+
+            # ...and remember what this imported name was decided to mean, so the next batch
+            # carrying the same spelling arrives with the answer already filled in. Recorded
+            # here rather than on every save because a verified species IS the decision; an
+            # edit that only fixes a jar size is not.
+            _decided_taxon = (update_data.taxon_id
+                              if getattr(update_data, "taxon_id", None) is not None
+                              else existing_record.get("TaxonID"))
+            if _decided_taxon is not None:
+                _vt = await execute_query(
+                    'SELECT vt.verbatim_genus, vt.verbatim_species, p.batch_serial_id '
+                    "FROM verbatim_taxonomic vt "
+                    'JOIN primary_temp p ON p."verbatim_taxonid" = vt."verbatim_taxonid" '
+                    'WHERE vt."verbatim_taxonid" = $1',
+                    existing_record["verbatim_taxonid"])
+                if _vt:
+                    await NameDecisionService.record(
+                        _vt[0]["verbatim_genus"], _vt[0]["verbatim_species"], _decided_taxon,
+                        decided_by=update_data.verified_by,
+                        source_batch=_vt[0]["batch_serial_id"] or "",
+                        source="record_edit")
 
         # Collector lives on verbatim_locality (not primary_temp); update it there.
         if (getattr(update_data, "collector_name", None) is not None
@@ -2060,6 +2166,122 @@ async def mark_batch_completed(batch_serial_id: str):
         )
 
 
+# ------------------------------------------------------------------------------------------
+# Name groups: one decision per imported name, instead of one per record.
+#
+# The importer does not deduplicate names -- one verbatim_taxonomic row per spreadsheet row --
+# so batch 20251023-001 asked for the same judgement 1362 times for `campostoma anomalum`
+# alone. These endpoints let the curator answer once. See app/services/name_group_service.py.
+# ------------------------------------------------------------------------------------------
+
+class NameGroupApplyModel(BaseModel):
+    name_key: str
+    # The taxon the curator actually looked at. Required, not inferred: in a group whose
+    # records suggest more than one taxon, only the confirmed one is applied.
+    taxon_id: int
+    applied_by: str = ""
+    # False (default): only records the importer matched to this same taxon -- the Apply
+    # button on a row showing that suggestion.
+    # True: every still-pending record carrying the name, whatever the importer suggested for
+    # it. This is the record editor's case, where the curator rejected the suggestion and
+    # chose a different taxon, so nothing in the batch is matched to their answer and the
+    # default filter would return nothing at all.
+    whole_name: bool = False
+
+
+class NameGroupUndoModel(BaseModel):
+    undone_by: str = ""
+
+
+@router.get("/batches/{batch_serial_id}/name-groups", response_model=ResponseModel)
+async def list_name_groups(
+    batch_serial_id: str,
+    only_pending: bool = Query(True, description="only records still awaiting species review"),
+    min_size: int = Query(2, ge=1, description="hide names carried by fewer records than this"),
+):
+    """Distinct imported names in the batch, largest first, with the taxon each one suggests."""
+    try:
+        return ResponseModel(code=20000, data=await name_groups.groups(
+            batch_serial_id, only_pending=only_pending, min_size=min_size))
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to list name groups: {e}")
+
+
+@router.post("/batches/{batch_serial_id}/name-groups/preview", response_model=ResponseModel)
+async def preview_name_group(batch_serial_id: str, body: NameGroupApplyModel):
+    """What applying this group would do -- how many records, and whether the family
+    reference check will leave them pending anyway."""
+    try:
+        result = await name_groups.preview(batch_serial_id, body.name_key, body.taxon_id,
+                                           body.whole_name)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        return ResponseModel(code=20000, data=result)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to preview the group: {e}")
+
+
+@router.post("/batches/{batch_serial_id}/name-groups/apply", response_model=ResponseModel)
+async def apply_name_group(batch_serial_id: str, body: NameGroupApplyModel):
+    """Assign the confirmed taxon to every species-pending record carrying this name.
+
+    Same rules as the single-record path: the family reference check decides verified vs
+    pending, and both family warnings are written per record. Undoable.
+    """
+    try:
+        result = await name_groups.apply(batch_serial_id, body.name_key, body.taxon_id,
+                                         body.applied_by, body.whole_name)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        msg = f"{result['records_applied']} records set to {result['species_status']}"
+        if result["family_reference_warning"]:
+            msg += " -- the family disagrees with the reference; flagged on each record"
+        return ResponseModel(code=20000, data=result, message=msg)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to apply the group: {e}")
+
+
+@router.get("/batches/{batch_serial_id}/name-groups/history", response_model=ResponseModel)
+async def name_group_history(batch_serial_id: str, limit: int = Query(50, ge=1, le=500)):
+    """Past group applies for this batch, newest first."""
+    try:
+        rows = await name_groups.history(batch_serial_id, limit)
+        return ResponseModel(code=20000, data={"items": rows, "total": len(rows)})
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to list group applies: {e}")
+
+
+@router.get("/name-groups/{op_id}/undo-preview", response_model=ResponseModel)
+async def preview_undo_name_group(op_id: int):
+    """How many records an undo would restore, and how many it would leave alone because they
+    were edited after the apply."""
+    try:
+        result = await name_groups.undo_preview(op_id)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        return ResponseModel(code=20000, data=result)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to preview the undo: {e}")
+
+
+@router.post("/name-groups/{op_id}/undo", response_model=ResponseModel)
+async def undo_name_group(op_id: int, body: NameGroupUndoModel):
+    """Put every record this apply touched back the way it was. Records edited since are
+    skipped rather than overwritten."""
+    try:
+        result = await name_groups.undo(op_id, body.undone_by)
+        if "error" in result:
+            return ResponseModel(code=40000, message=result["error"])
+        msg = f"{result['records_restored']} records restored"
+        if result["records_skipped"]:
+            _ids = ", ".join(str(i) for i in result.get("skipped_record_ids", [])[:5])
+            msg += (f"; {result['records_skipped']} left alone because they were edited "
+                    f"after the apply" + (f" ({_ids}…)" if _ids else ""))
+        return ResponseModel(code=20000, data=result, message=msg)
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to undo: {e}")
+
+
 @router.get("/batches/{batch_serial_id}/progress", response_model=ResponseModel)
 async def get_batch_progress(batch_serial_id: str):
     """
@@ -2498,9 +2720,16 @@ async def batch_update_verification_status(update_data: BatchVerificationUpdateM
         )
 
 
+class ApplySuggestionModel(BaseModel):
+    # Who is confirming. Optional so the existing call sites keep working, but without it the
+    # record is indistinguishable from one the importer matched by itself.
+    applied_by: Optional[str] = None
+
+
 # 新增应用分类建议端点 - 添加验证状态更新
 @router.post("/records/{record_id}/apply-suggestion", response_model=ResponseModel)
-async def apply_taxonomic_suggestion(record_id: int):
+async def apply_taxonomic_suggestion(record_id: int,
+                                     body: Optional[ApplySuggestionModel] = None):
     """
     应用分类建议并更新验证状态
     """
@@ -2545,19 +2774,34 @@ async def apply_taxonomic_suggestion(record_id: int):
         apply_result = await execute_query(apply_query, suggested_taxon_id, species_status, datetime.now(), record_id)
 
         if apply_result:
-            # 标记建议已应用
-            mark_applied_query = """
-            UPDATE verbatim_taxonomic
-            SET "suggestion_applied" = true
-            WHERE "verbatim_taxonid" = (
-                SELECT "verbatim_taxonid" FROM primary_temp WHERE "PrimaryID" = $1
-            )
-            """
-
-            await execute_mutation(mark_applied_query, record_id)
+            # Stamp WHO confirmed it. This used to set verbatim_taxonomic."suggestion_applied",
+            # a column that does not exist -- so the statement threw, the endpoint reported
+            # failure even though the record above had already been written, and
+            # store_warnings below never ran (the family warning explaining a forced-pending
+            # record was silently dropped). The stamp is also the only thing that separates a
+            # curator's decision from auto_verify_imported_records' automatic exact match,
+            # which writes the very same "TaxonID" and status.
+            await execute_mutation(
+                'UPDATE verbatim_taxonomic SET verified_by_name = $2, verified_at = NOW() '
+                'WHERE "verbatim_taxonid" = ('
+                '    SELECT "verbatim_taxonid" FROM primary_temp WHERE "PrimaryID" = $1)',
+                record_id, ((body.applied_by if body else None) or "")[:120] or None)
 
             # record (or clear) both family warnings
             await store_warnings(record_id, [ref_warning, sugg_warning])
+
+            # ...and remember the name -> taxon decision for later batches
+            _vt = await execute_query(
+                'SELECT vt.verbatim_genus, vt.verbatim_species, p.batch_serial_id '
+                "FROM primary_temp p "
+                'JOIN verbatim_taxonomic vt ON vt."verbatim_taxonid" = p."verbatim_taxonid" '
+                'WHERE p."PrimaryID" = $1', record_id)
+            if _vt:
+                await NameDecisionService.record(
+                    _vt[0]["verbatim_genus"], _vt[0]["verbatim_species"], suggested_taxon_id,
+                    decided_by=((body.applied_by if body else None) or ""),
+                    source_batch=_vt[0]["batch_serial_id"] or "",
+                    source="apply_suggestion")
 
             return ResponseModel(
                 code=20000,

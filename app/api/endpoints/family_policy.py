@@ -152,6 +152,25 @@ class UndoReassignModel(BaseModel):
     undone_by: str
 
 
+@router.get("/taxon/{taxon_id}", response_model=ResponseModel)
+async def taxon_for_move(taxon_id: int):
+    """One taxon with its current family and specimen load, for opening the move dialog on it
+    directly.
+
+    The disagreement list can only be entered per (local family -> reference family) pair, but
+    a curator arriving from batch review has a record in front of them, not a pair -- and the
+    family they think is wrong may not disagree with the Catalog at all, in which case no pair
+    row exists to click. This is the way in for that case.
+    """
+    try:
+        rows = await reassign_service._taxa_rows([taxon_id])  # noqa: SLF001 - same package
+        if not rows:
+            return ResponseModel(code=40400, message=f"Taxon {taxon_id} not found")
+        return ResponseModel(code=20000, data={"taxon": dict(rows[0])})
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to load the taxon: {e}")
+
+
 @router.post("/reassign/preview", response_model=ResponseModel)
 async def preview_reassign(body: ReassignModel):
     """What the move would do -- including which taxa are already in the target family, and

@@ -111,6 +111,30 @@ async def family_reference_warning(taxon_id):
     }
 
 
+def build_suggestion_warning(src_fam, matched_fam):
+    """The suggestion warning for one (imported family, matched family) pair, or None if
+    there is nothing to complain about.
+
+    Split out so the per-record path below and the name-group bulk path
+    (app/services/name_group_service.py) produce the SAME message: a curator comparing one
+    record against a group of 1300 must not see two different wordings for one condition.
+    """
+    src_fam = (src_fam or "").strip()
+    matched_fam = (matched_fam or "").strip()
+    # blank source family is not "wrong": there is simply nothing to contradict
+    if not src_fam or not matched_fam or src_fam.lower() == matched_fam.lower():
+        return None
+    return {
+        "field": "Family",
+        "issue_type": ISSUE_SUGGESTION,
+        "severity": "warning",
+        "message": (
+            f"Imported family '{src_fam}' differs from the matched taxon's family "
+            f"'{matched_fam}'. Confirm the family is correct."
+        ),
+    }
+
+
 async def family_suggestion_warning(record_id, taxon_id):
     """Return a warning dict if the IMPORTED (verbatim) family differs from the matched
     taxon's family -- i.e. the source family was wrong/reclassified by the match (e.g.
@@ -127,30 +151,16 @@ async def family_suggestion_warning(record_id, taxon_id):
         'WHERE pt."PrimaryID" = $1',
         record_id,
     )
-    if not vt or not (vt[0]["verbatim_family"] or "").strip():
-        return None  # no source family -> nothing to contradict (blank is not "wrong")
-    src_fam = vt[0]["verbatim_family"].strip()
+    if not vt:
+        return None
+    src_fam = vt[0]["verbatim_family"]
 
     row = await execute_query(
         'SELECT f."FamilyName" FROM "TaxonomicTable" tt '
         'JOIN "Family" f ON tt."FamilyID" = f."FamilyID" WHERE tt."TaxonID" = $1',
         taxon_id,
     )
-    if not row or not row[0]["FamilyName"]:
-        return None
-    matched_fam = row[0]["FamilyName"]
-    if src_fam.lower() == matched_fam.lower():
-        return None
-
-    return {
-        "field": "Family",
-        "issue_type": ISSUE_SUGGESTION,
-        "severity": "warning",
-        "message": (
-            f"Imported family '{src_fam}' differs from the matched taxon's family "
-            f"'{matched_fam}'. Confirm the family is correct."
-        ),
-    }
+    return build_suggestion_warning(src_fam, row[0]["FamilyName"] if row else None)
 
 
 async def store_warnings(record_id, warnings):

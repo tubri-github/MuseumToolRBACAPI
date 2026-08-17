@@ -311,6 +311,45 @@ class SpeciesNameValidator:
 
         return name
 
+    # 'c. chrysocephalus' -- a one-letter abbreviation followed by one word
+    _ABBREV_EPITHET_RE = re.compile(r'^([a-z])\.\s+([a-z][a-z\-]*)$')
+
+    def expand_abbreviated_epithet(self, genus: str, species: str,
+                                   subspecies_index: Optional[Dict] = None) -> str:
+        """Expand a label that abbreviates the SPECIES epithet to its initial.
+
+        When a subspecies is written out, the species epithet in front of it is often reduced
+        to a letter, because the reader is expected to fill it in:
+
+            genus 'NOTROPIS' + species 'C. CHRYSOCEPHALUS'
+                -> 'chrysocephalus chrysocephalus'   (the nominotypical subspecies)
+            genus 'NOCOMIS'  + species 'L. BELLICUS'
+                -> 'leptocephalus bellicus'          (looked up: which Nocomis has bellicus?)
+
+        Left alone, the matcher compares 'l. leptocephalus' as a plain string and lands on a
+        DIFFERENT subspecies of the same species by similarity -- 106 records in batch
+        20260806-001 were pointed at `Nocomis leptocephalus bellicus` that way, while the 2
+        records that really were bellicus got no match at all.
+
+        Two cases, and nothing is guessed beyond them:
+          - the initial matches the following word ('c.' + 'chrysocephalus'): that only works
+            out if species and subspecies are the same word, i.e. the nominotypical
+            subspecies, so the word is simply doubled.
+          - otherwise the species is unknown, so (genus, subspecies) is looked up in the
+            reference. An ambiguous or missing lookup returns the input untouched rather than
+            inventing a name.
+        """
+        m = self._ABBREV_EPITHET_RE.match((species or "").strip().lower())
+        if not m:
+            return species
+        initial, following = m.group(1), m.group(2)
+        if following.startswith(initial):
+            return f"{following} {following}"
+        found = (subspecies_index or {}).get(((genus or "").strip().lower(), following))
+        if found and found.startswith(initial):
+            return f"{found} {following}"
+        return species
+
     def process_authority(self, taxon_name: str) -> str:
         """处理学名中的权威人名缩写"""
         if pd.isna(taxon_name) or not taxon_name:
@@ -340,10 +379,36 @@ class SpeciesNameValidator:
             self._cache_timestamp is None or
             current_time - self._cache_timestamp > self._cache_ttl):
 
-            # 重新加载数据
+            # Read "TaxonomicTable" directly instead of the taxonomic_table VIEW. The view
+            # exposes only Genus/Species, so every subspecies collapsed onto its species'
+            # key: 218 keys had a subspecies competing with the plain species, one row won
+            # the dict arbitrarily and the rest were unreachable by exact match. 'Nocomis
+            # leptocephalus' resolved to the interocularis SUBSPECIES, and the correct
+            # species-level row could not be matched at all.
+            #
+            # FullScientificName is the authoritative name (same choice as
+            # taxon_check_service; see memory taxonomictable_genus_corrupted) and it already
+            # includes the subspecies, so it is what the keys are built from. The Genus /
+            # Species / Subspecies columns are only a fallback for rows with no full name.
+            # Row order decides who wins a duplicated key, so it is pinned rather than left to
+            # whatever the planner returns -- otherwise the same input can match differently
+            # from one run to the next. Taxa the collection is actually determined against win
+            # first (matching a record onto an in-use taxon beats stranding it on an unused
+            # duplicate), then the oldest TaxonID. 137 keys still have more than one taxon
+            # behind them: 44 are genuine duplicate rows awaiting the curator's merge, and most
+            # of the rest are 'X sp.' placeholders colliding with the plain genus.
             db_query = """
-            SELECT "TaxonID", "FamilyName", "Genus", "Species"
-            FROM taxonomic_table
+            SELECT t."TaxonID", f."FamilyName", t."Genus", t."Species", t."Subspecies",
+                   t."FullScientificName"
+            FROM "TaxonomicTable" t
+            JOIN "Family" f ON f."FamilyID" = t."FamilyID"
+            LEFT JOIN (
+                SELECT "TaxonID", count(*) AS in_use
+                FROM "Determination"
+                WHERE "IsCurrent" = true
+                GROUP BY "TaxonID"
+            ) d ON d."TaxonID" = t."TaxonID"
+            ORDER BY COALESCE(d.in_use, 0) DESC, t."TaxonID" ASC
             """
 
             db_taxonomic = await execute_query(db_query)
@@ -356,21 +421,30 @@ class SpeciesNameValidator:
             # 预处理数据库数据
             db_df['original_genus'] = db_df['Genus'].fillna('')
             db_df['original_species'] = db_df['Species'].fillna('')
-            db_df['original_full_name'] = db_df['original_genus'] + ' ' + db_df['original_species']
+            db_df['original_subspecies'] = db_df['Subspecies'].fillna('')
+            # what the curator sees quoted back at them: the real name, not a re-assembled one
+            db_df['original_full_name'] = db_df.apply(
+                lambda r: (str(r['FullScientificName']).strip()
+                           if pd.notna(r['FullScientificName'])
+                           and str(r['FullScientificName']).strip()
+                           else ' '.join(x for x in (r['original_genus'],
+                                                     r['original_species'],
+                                                     r['original_subspecies']) if x).strip()),
+                axis=1)
 
-            db_df['processed_genus'] = db_df['Genus'].apply(
-                lambda x: self.process_authority(x))
-            db_df['processed_species'] = db_df['Species'].apply(
-                lambda x: self.process_authority(x))
+            # The name the keys come from, normalised once. normalize_taxon_name strips
+            # nomenclatural markers, so 'Chiloglanis sp. Badi' keeps its informal epithet
+            # while 'sp.' goes -- the same treatment the import side gets.
+            db_df['normalized_full_name'] = db_df['original_full_name'].apply(
+                lambda x: self.normalize_taxon_name(self.process_authority(x)))
 
-            db_df['normalized_genus'] = db_df['processed_genus'].apply(
-                lambda x: self.normalize_taxon_name(x))
-            db_df['normalized_species'] = db_df['processed_species'].apply(
-                lambda x: self.normalize_taxon_name(x))
-
-            db_df['normalized_full_name'] = (
-                db_df['normalized_genus'] + ' ' + db_df['normalized_species']
-            ).str.strip()
+            # Genus stays the first word of the authoritative name and species the rest, so
+            # genus_index and the soundex buckets keep meaning what they meant before while
+            # the full-name key gains the subspecies.
+            _split = db_df['normalized_full_name'].apply(
+                lambda x: (x.split(' ', 1) + [''])[:2] if x else ['', ''])
+            db_df['normalized_genus'] = _split.apply(lambda p: p[0])
+            db_df['normalized_species'] = _split.apply(lambda p: p[1].strip())
 
             # 建立多种索引以提高匹配效率
             # 1. 完全匹配索引
@@ -379,12 +453,24 @@ class SpeciesNameValidator:
             genus_index = {}
             # 3. 语音编码索引
             phonetic_dict = {}
+            # 4. (genus, subspecies) -> species, for expanding abbreviated labels like
+            #    'Nocomis L. bellicus' back to 'Nocomis leptocephalus bellicus'
+            subspecies_index = {}
 
+            key_collisions = 0
             for idx, row in db_df.iterrows():
                 if pd.notna(row['normalized_full_name']) and row['normalized_full_name'].strip():
                     # 完全匹配索引
                     normalized_name = row['normalized_full_name']
-                    exact_match_dict[normalized_name] = idx
+                    # First writer wins, and the row order is the query's TaxonID-agnostic
+                    # order, so this is only well-defined because duplicates are counted and
+                    # logged rather than silently overwritten. Genuine duplicate rows (same
+                    # FullScientificName twice) still collide -- that is the curator's merge
+                    # queue, not something to paper over here.
+                    if normalized_name in exact_match_dict:
+                        key_collisions += 1
+                    else:
+                        exact_match_dict[normalized_name] = idx
 
                     # 按属名分组索引（用于优化模糊匹配和拼写错误匹配）
                     genus = row['normalized_genus']
@@ -392,6 +478,17 @@ class SpeciesNameValidator:
                         if genus not in genus_index:
                             genus_index[genus] = []
                         genus_index[genus].append(idx)
+
+                    sub = str(row['original_subspecies'] or '').strip().lower()
+                    species = str(row['original_species'] or '').strip().lower()
+                    if genus and sub and species:
+                        sub_key = (genus, sub)
+                        # ambiguous (two species in one genus sharing a subspecies epithet)
+                        # is recorded as None so the expansion refuses to guess
+                        if sub_key in subspecies_index and subspecies_index[sub_key] != species:
+                            subspecies_index[sub_key] = None
+                        else:
+                            subspecies_index.setdefault(sub_key, species)
 
                     # 创建语音编码索引
                     genus_sound = jellyfish.soundex(row['normalized_genus']) if pd.notna(row['normalized_genus']) and row['normalized_genus'] else ""
@@ -402,12 +499,17 @@ class SpeciesNameValidator:
                             phonetic_dict[phonetic_key] = []
                         phonetic_dict[phonetic_key].append(idx)
 
+            if key_collisions:
+                print(f"[matcher] {key_collisions} taxa share a name already in the index "
+                      f"and are unreachable by exact match (duplicate rows -- merge queue)")
+
             # 缓存数据
             self._cached_db_data = {
                 'df': db_df,
                 'exact_match_dict': exact_match_dict,
                 'genus_index': genus_index,
-                'phonetic_dict': phonetic_dict
+                'phonetic_dict': phonetic_dict,
+                'subspecies_index': subspecies_index
             }
             self._cache_timestamp = current_time
 
@@ -484,6 +586,12 @@ class SpeciesNameValidator:
             .str.replace(r'\[[^\]]*\]', '', regex=True)
             .str.replace(r'"[^"]*"', '', regex=True)
             .str.replace(r"'[^']*'", '', regex=True)
+            # Sources put the open-nomenclature marker in the GENUS cell as often as in the
+            # species cell: 'NOTROPIS SP.' with an empty species is the same identification as
+            # 'NOTROPIS' + 'SP.', but only the second one matched -- the first was compared as
+            # the literal string 'notropis sp.' and found nothing. ~93 records in batch
+            # 20260806-001 were lost this way.
+            .str.replace(r'\s+(sp|spp|ssp)\.?\s*$', '', regex=True)
             # 处理连字符和下划线
             .str.replace('-', ' ', regex=False)
             .str.replace('_', ' ', regex=False)
@@ -500,8 +608,12 @@ class SpeciesNameValidator:
             # 移除常见的分类学标记
             .str.replace(r'\bsp\.?\s*$', '', regex=True)
             .str.replace(r'\bspp\.?\s*$', '', regex=True)
-            .str.replace(r'\bvar\.\s+\S+', '', regex=True)
-            .str.replace(r'\bsubsp\.\s+\S+', '', regex=True)
+            # Drop the RANK MARKER but keep the epithet after it: 'umbratilis subsp.
+            # cyanocephalus' is an identification down to the subspecies, and deleting
+            # 'subsp. cyanocephalus' wholesale threw away the only part that distinguishes it
+            # from the species. The reference side now carries subspecies in its keys, so the
+            # word has somewhere to match.
+            .str.replace(r'\b(var|subsp|ssp)\.\s+', '', regex=True)
             # 移除括号和引号内容
             .str.replace(r'\([^)]*\)', '', regex=True)
             .str.replace(r'\[[^\]]*\]', '', regex=True)
@@ -512,6 +624,19 @@ class SpeciesNameValidator:
             .str.replace(r'\s+', ' ', regex=True)
             .str.strip()
         )
+
+        # 'C. CHRYSOCEPHALUS' -> 'chrysocephalus chrysocephalus'. Applied row-wise because it
+        # needs the genus and a reference lookup; only the handful of rows that actually carry
+        # an abbreviation are touched, so this is not a per-row cost for the batch.
+        _abbrev_mask = import_df['normalized_species'].str.match(r'^[a-z]\.\s', na=False)
+        if _abbrev_mask.any():
+            subspecies_index = cached_data.get('subspecies_index') or {}
+            import_df.loc[_abbrev_mask, 'normalized_species'] = import_df[_abbrev_mask].apply(
+                lambda r: self.expand_abbreviated_epithet(
+                    r['normalized_genus'], r['normalized_species'], subspecies_index), axis=1)
+            expanded = int(_abbrev_mask.sum())
+            print(f"      ✓ Expanded {expanded} abbreviated species epithet(s)")
+            logger.info(f"Expanded {expanded} abbreviated species epithet(s)")
 
         import_df['normalized_full_name'] = (
             import_df['normalized_genus'] + ' ' + import_df['normalized_species']

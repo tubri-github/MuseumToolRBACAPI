@@ -17,7 +17,9 @@ from app.db.database import execute_query, execute_mutation
 from app.utils.species_validation import SpeciesNameValidator, validate_scientific_name
 from app.utils.validation import ImportValidationUtils
 from app.utils.db_import import DatabaseUtils
+from app.services.name_decision_service import NameDecisionService, name_key
 from app.services.taxon_reference_check import (
+    build_suggestion_warning,
     family_reference_warning, family_suggestion_warning,
 )
 from app.services.synonym_service import SynonymService
@@ -489,6 +491,28 @@ async def confirm_import(import_data: ConfirmImportModel, background_tasks: Back
         )
 
 
+def _curator_decided_species(record: Dict) -> bool:
+    """Has a person settled this record's species, as opposed to the importer matching it?
+
+    Any one of three marks is enough, and each covers a case the others miss:
+      - a signature on the verbatim row (written by the record editor, apply-suggestion and
+        name-group apply). The only positive proof, but the column was added on 2026-08-14, so
+        everything decided before that has none.
+      - "TaxonID" differs from the suggestion. The curator replaced the answer -- exactly what
+        `Dorosoma petenense` -> mexicanus corrections look like.
+      - verified while the match is not 'exact'. The importer only ever auto-verifies exact
+        matches, so a verified fuzzy/phonetic/no_match record was verified by hand. This is
+        how the 195 no_match records a curator typed a taxon into are recognised.
+    """
+    if (record.get("verified_by_name") or "").strip():
+        return True
+    current, suggested = record.get("current_taxon_id"), record.get("matched_taxon_id")
+    if current is not None and current != suggested:
+        return True
+    return ((record.get("current_species_status") or "") == "verified"
+            and record.get("species_match_status") != "exact")
+
+
 async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial_id: str):
     """
     自动验证导入的记录
@@ -496,11 +520,22 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
     1. 如果species name是exact match -> species_verification_status = 'verified'
     2. 如果field number在locality1中找到exact match -> locality_verification_status = 'verified'
     3. record details验证: 允许空值和轻微错误 -> record_verification_status = 'verified' (但记录warnings)
+
+    A record the curator has already decided is left alone (see _curator_decided_species).
+    This function runs on import, where nothing has been decided yet, but it is ALSO what the
+    "Re-validate" button re-runs on a batch the curator has been working in for weeks -- and
+    there it used to overwrite their work: 332 hand-corrected "TaxonID" values were pushed back
+    to the importer's suggestion (170 records off `Dorosoma petenense` onto the mexicanus
+    subspecies alone), 448 hand-verified records were knocked back to pending because their
+    match_status is not 'exact', and 435 verification_notes were replaced with "Auto-verified
+    on import". Batch 20251119-001 had already been migrated in that state.
     """
     try:
         from app.db.database import execute_transaction
 
         # 批量查询所有需要验证的记录
+        # The curator's own state is selected too, so their decisions can be recognised and
+        # kept rather than recomputed from the import-time match.
         query = """
         SELECT
             p."PrimaryID",
@@ -512,8 +547,13 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
             p."PrevNumber",
             p."Inventory",
             p."verification_warnings",
+            p."TaxonID" as current_taxon_id,
+            p."species_verification_status" as current_species_status,
+            p."verification_notes" as current_notes,
             vt."match_status" as species_match_status,
             vt."matched_taxon_id",
+            vt."verified_by_name",
+            vt."verbatim_family",
             vl."verbatim_fieldno"
         FROM primary_temp p
         LEFT JOIN verbatim_taxonomic vt ON p."verbatim_taxonid" = vt."verbatim_taxonid"
@@ -527,8 +567,32 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
             print(f"No records found for batch {batch_serial_id}")
             return
 
+        # The two family checks used to run per RECORD: 2-4 queries each, so a 21717-record
+        # batch cost ~43000 round trips and the 64186-record one did not finish inside ten
+        # minutes -- with a loading mask over the curator's screen the whole time. Both checks
+        # depend only on the taxon (the reference lookup and the taxon's own family), and a
+        # batch has a few hundred distinct taxa, so they are resolved once per taxon here.
+        # The record-specific half of the suggestion check is the imported family, which the
+        # query above now carries, so build_suggestion_warning can be called directly.
+        taxon_ids = {t for r in records
+                     for t in (r.get("matched_taxon_id"), r.get("current_taxon_id"))
+                     if t is not None}
+        taxon_family = {}
+        if taxon_ids:
+            for row in await execute_query(
+                    'SELECT tt."TaxonID", f."FamilyName" FROM "TaxonomicTable" tt '
+                    'LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID" '
+                    'WHERE tt."TaxonID" = ANY($1::int[])', sorted(taxon_ids)):
+                taxon_family[row["TaxonID"]] = row["FamilyName"]
+        ref_warning_cache = {}
+        for tid in sorted(taxon_ids):
+            ref_warning_cache[tid] = await family_reference_warning(tid)
+        print(f"Family checks resolved for {len(taxon_ids)} distinct taxa "
+              f"(was once per record)")
+
         # 为每条记录构建更新语句
         update_statements = []
+        curator_kept = 0
 
         for record in records:
             primary_id = record["PrimaryID"]
@@ -549,7 +613,26 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
                     existing_warnings = []
 
             # 1. 验证 species name (exact match 自动验证)
-            if record["species_match_status"] == "exact":
+            curator_decided = _curator_decided_species(record)
+            if curator_decided:
+                # Keep the decision exactly as it stands: the status, the "TaxonID" (not
+                # written here at all) and the notes below. The family checks still run so a
+                # warning that became true later is not lost, but they cannot change a status
+                # a person set.
+                species_status = record.get("current_species_status") or "pending"
+                if record.get("current_taxon_id") is not None:
+                    ref_w = ref_warning_cache.get(record["current_taxon_id"])
+                    sugg_w = build_suggestion_warning(
+                        record.get("verbatim_family"),
+                        taxon_family.get(record["current_taxon_id"]))
+                    if ref_w:
+                        family_warnings.append(ref_w)
+                    if sugg_w:
+                        family_warnings.append(sugg_w)
+                curator_kept += 1
+                print(f"Record {primary_id}: Species left as decided by a curator "
+                      f"({species_status}, TaxonID={record.get('current_taxon_id')})")
+            elif record["species_match_status"] == "exact":
                 species_status = "verified"
                 # 同时把匹配到的 taxon 回填到 TaxonID（仿照下面 locality 分支写 Locality1ID）。
                 # 之前这里只置 verified、没写 TaxonID，导致 exact 自动验证的记录 TaxonID 为 NULL，
@@ -564,8 +647,9 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
                     #  - reference mismatch -> warning + downgrade species to pending (review)
                     #  - imported-vs-matched family mismatch -> warning only (surfaces the
                     #    wrong/reclassified source family, e.g. DOROSOMA filed as CYPRINIDAE)
-                    ref_w = await family_reference_warning(matched_taxon_id)
-                    sugg_w = await family_suggestion_warning(primary_id, matched_taxon_id)
+                    ref_w = ref_warning_cache.get(matched_taxon_id)
+                    sugg_w = build_suggestion_warning(record.get("verbatim_family"),
+                                                      taxon_family.get(matched_taxon_id))
                     if ref_w:
                         family_warnings.append(ref_w)
                         species_status = "pending"
@@ -693,6 +777,12 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
 
             # 5. 构建更新语句
             verification_notes = f"Auto-verified on import. Warnings: {'; '.join(warnings)}" if warnings else "Auto-verified on import"
+            # Never overwrite a note a person wrote. The field is shared, and the only thing
+            # distinguishing the two is that this function's own text starts with a known
+            # prefix -- anything else came from the record editor and is the curator's.
+            _existing_notes = (record.get("current_notes") or "").strip()
+            if _existing_notes and not _existing_notes.startswith("Auto-verified on import"):
+                verification_notes = _existing_notes
 
             # 合并已有的import warnings、字段warnings、family检查warnings
             all_warnings = existing_warnings + record_warnings_detail + family_warnings
@@ -720,7 +810,9 @@ async def auto_verify_imported_records(primary_temp_ids: List[int], batch_serial
         if update_statements:
             print(f"Executing {len(update_statements)} verification updates...")
             await execute_transaction(update_statements)
-            print(f"Auto-verification completed for {len(records)} records")
+            print(f"Auto-verification completed for {len(records)} records"
+                  + (f", {curator_kept} left untouched as already decided by a curator"
+                     if curator_kept else ""))
 
     except Exception as e:
         print(f"Error during auto-verification: {str(e)}")
@@ -952,6 +1044,19 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         "match_info": match_info
                     }
 
+        # Curator decisions from earlier batches, fetched once for the whole spreadsheet. The
+        # keys are built the same way apply-by-name groups records, so a decision made through
+        # either route is found by the other.
+        _genus_col = mappings.get("genus", "")
+        _species_col = mappings.get("species", "")
+        _keys = {name_key(str(r.get(_genus_col, "") or ""), str(r.get(_species_col, "") or ""))
+                 for _, r in df.iterrows()} if (_genus_col or _species_col) else set()
+        _name_decisions = await NameDecisionService.lookup_many([k for k in _keys if k])
+        _decision_reuse = {}
+        if _name_decisions:
+            print(f"[decisions] {len(_name_decisions)} of {len(_keys)} distinct imported names "
+                  f"have a curator decision from an earlier batch")
+
         # verbatim导入包含所有记录，即使验证失败的记录也会导入
         valid_records = []
         verbatim_taxonomic_records = []
@@ -1009,6 +1114,42 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 print(f"[CoF] row {index}: accepted '{cof.get('accepted_name')}' "
                       f"({cof.get('cof_family')}) not in local -> create-suggestion attached")
 
+            # Last resort: has a curator already decided what this spelling means?
+            #
+            # Only consulted when neither name matching nor CoF produced an exact answer --
+            # i.e. exactly the rows that would otherwise land on the curator's desk for a
+            # judgement someone has already made on a previous batch.
+            #
+            # It fills in the taxon and marks the row, but deliberately does NOT set
+            # match_status to 'exact', because 'exact' is what auto-verifies a record. The
+            # record stays pending with the answer pre-filled, so a wrong old decision shows
+            # up for review instead of spreading silently through every future import.
+            historical_decision_id = None
+            if match_result.get("match_status") != "exact":
+                _decision = _name_decisions.get(
+                    name_key(str(genus_value or ""), str(species_value or "")))
+                if _decision and _decision.get("taxon_id"):
+                    historical_decision_id = _decision["id"]
+                    _mi = match_result.get("match_info")
+                    _mi = _mi if isinstance(_mi, dict) else {}
+                    match_result = {
+                        **match_result,
+                        "matched": True,
+                        "taxon_id": _decision["taxon_id"],
+                        "match_info": {**_mi, "historical_decision": {
+                            "id": _decision["id"],
+                            "taxon_id": _decision["taxon_id"],
+                            "taxon_name": _decision.get("current_taxon_name")
+                                          or _decision.get("taxon_name"),
+                            "decided_by": _decision.get("decided_by"),
+                            "decided_at": (_decision["decided_at"].isoformat()
+                                           if _decision.get("decided_at") else None),
+                            "source_batch": _decision.get("source_batch"),
+                        }},
+                    }
+                    _decision_reuse[_decision["id"]] = _decision_reuse.get(
+                        _decision["id"], 0) + 1
+
             verbatim_taxonomic_record = {
                 "verbatim_family": str(family_value) if pd.notna(family_value) and str(family_value).strip() else None,
                 "verbatim_genus": str(genus_value) if pd.notna(genus_value) and str(genus_value).strip() else None,
@@ -1021,7 +1162,8 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "match_status": match_result["match_status"],
                 "matched_taxon_id": match_result["taxon_id"],
                 "match_confidence": match_result["confidence"],
-                "match_info": match_result["match_info"]
+                "match_info": match_result["match_info"],
+                "historical_decision_id": historical_decision_id
             }
 
             # 2. 准备verbatim locality记录 - 存储原始的地点信息
@@ -1174,6 +1316,14 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
         # 8.5. 自动验证导入的记录并更新验证状态
         print(f"Auto-verifying {len(primary_temp_ids)} records...")
         await auto_verify_imported_records(primary_temp_ids, batch_serial_id)
+
+        # 8.6. Count how many records each reused decision pre-filled, so the reference table
+        # can show which entries are actually carrying weight (and which never fire).
+        for _did, _n in _decision_reuse.items():
+            await NameDecisionService.mark_reused(_did, _n)
+        if _decision_reuse:
+            print(f"[decisions] pre-filled {sum(_decision_reuse.values())} records from "
+                  f"{len(_decision_reuse)} earlier curator decisions (left pending for review)")
 
         # 9. 更新导入状态
         await store_import_status(file_id, {
