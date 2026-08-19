@@ -159,10 +159,12 @@ async def new_staff(data: StaffModel):
     """
 
     try:
+        # column order is FirstName, LastName -- these two used to be passed the
+        # other way round, which stored every new staff member name-reversed
         result = await execute_query(
             query,
-            data.lastName,
             data.firstName,
+            data.lastName,
             data.middleName,
             data.title,
             data.agentType,

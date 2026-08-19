@@ -60,6 +60,35 @@ class NameGroupService:
     # ---- listing -------------------------------------------------------------------------
 
     @staticmethod
+    async def inconsistent_summary(batch_serial_id: str) -> Dict[str, Any]:
+        """Just the two numbers behind the warning, so the workspace can badge the drawer
+        button without loading the drawer.
+
+        Deliberately NOT folded into the verification summary the workspace refetches after
+        every single save: this is a whole-batch GROUP BY and measures 250-350 ms on the two
+        large batches, which on that hot path would be paid on every Apply. It only changes
+        when a group is applied, so it is fetched when a batch is opened and after an apply.
+
+        The filters mirror groups(only_pending=True, min_size=2) exactly -- a badge that
+        counts something the drawer does not list is worse than no badge.
+        """
+        row = await execute_single_query(
+            "SELECT count(*) AS names, coalesce(sum(verified), 0) AS verified_inside FROM ("
+            f"  SELECT {NAME_KEY_SQL} AS name_key, "
+            f"         count(*) FILTER (WHERE NOT ({PENDING_SQL})) AS verified "
+            "  FROM primary_temp p "
+            "  JOIN verbatim_taxonomic vt ON vt.verbatim_taxonid = p.verbatim_taxonid "
+            f" WHERE p.batch_serial_id = $1 AND {NAME_KEY_SQL} <> '' "
+            f" GROUP BY 1 "
+            # >1 distinct suggestion = the matcher answered one spelling several ways
+            "  HAVING count(DISTINCT vt.matched_taxon_id) > 1 "
+            f"    AND count(*) FILTER (WHERE {PENDING_SQL}) >= 2"
+            ") x", batch_serial_id)
+        return {"batch_serial_id": batch_serial_id,
+                "inconsistent_names": row["names"] if row else 0,
+                "inconsistent_verified_records": row["verified_inside"] if row else 0}
+
+    @staticmethod
     async def groups(batch_serial_id: str, only_pending: bool = True,
                      min_size: int = 2) -> Dict[str, Any]:
         """Every distinct imported name in the batch, with how many records carry it.

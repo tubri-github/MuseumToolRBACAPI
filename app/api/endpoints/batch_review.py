@@ -2215,6 +2215,22 @@ async def list_name_groups(
         return ResponseModel(code=50000, message=f"Failed to list name groups: {e}")
 
 
+@router.get("/batches/{batch_serial_id}/name-groups/inconsistent-count",
+            response_model=ResponseModel)
+async def inconsistent_name_count(batch_serial_id: str):
+    """How many names in this batch the matcher answered inconsistently, for the badge on the
+    "Decide by name" button.
+
+    Separate from the verification summary on purpose -- see the note on
+    NameGroupService.inconsistent_summary.
+    """
+    try:
+        return ResponseModel(code=20000,
+                             data=await name_groups.inconsistent_summary(batch_serial_id))
+    except Exception as e:  # noqa: BLE001
+        return ResponseModel(code=50000, message=f"Failed to count inconsistent names: {e}")
+
+
 @router.post("/batches/{batch_serial_id}/name-groups/preview", response_model=ResponseModel)
 async def preview_name_group(batch_serial_id: str, body: NameGroupApplyModel):
     """What applying this group would do -- how many records, and whether the family
