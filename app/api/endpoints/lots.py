@@ -9,6 +9,7 @@ from starlette.responses import StreamingResponse
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_paginated_query_with_count, execute_transaction, get_db
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 from app.services.synonym_service import SynonymService
+from app.utils.request_params import parse_int_list, parse_int_or_none, parse_year_start
 
 _synonym_service = SynonymService()
 
@@ -327,7 +328,14 @@ async def get_lots(ids: str, pagination: PaginationParams = Depends()):
     Get lots by IDs.
     Mirrors the original getLots function.
     """
-    id_list = [int(id_str) for id_str in ids.split(',') if id_str]
+    # ids 来自 deaccession 页的 catalog# 输入框，前端变量为空时会拼出 "null"/"undefined"，
+    # 老写法 int() 裸跑直接 500（logs/errors.log 里 /lot/null/1 已有 6 次）。
+    id_list = parse_int_list(ids)
+    if not id_list:
+        # 返回与 execute_paginated_query_with_count 相同的形状，调用方不用分两种情况处理
+        return {"code": 20000, "data": {
+            "items": [], "total": 0, "page": pagination.page, "page_size": pagination.page_size,
+            "total_pages": 0, "has_next": False, "has_prev": False}}
     # 展平为直接 JOIN（ON 用真实表别名，避免旧版嵌套子查询里 "TaxonID" 等列名歧义报错）；
     # 只取当前鉴定（IsCurrent=true），一条 lot 一行；冲突列加别名（CurrentTaxonID/PrimaryRemarks）。
     query = """
@@ -387,11 +395,21 @@ async def get_lot_by_primary(primary_id: int):
 
 
 @router.get("/lotString/{catid}", response_model=ResponseModel)
-async def get_lot_string(catid: int):
+async def get_lot_string(catid: str):
     """
     Get lot string by catalog ID.
     Mirrors the original getLotString function.
+
+    catid arrives straight from the loan form's Catalog # box, so it is taken as
+    text: anything that is not a catalog number a column can hold (letters, a
+    "TU " prefix, the literal "undefined" from an empty row) is a search that
+    matches nothing, and the form shows its existing "No result". Declaring it
+    as int made FastAPI answer 422 with a validation dump instead.
     """
+    catalog_number = parse_int_or_none(catid)
+    if catalog_number is None:
+        return {"code": 20000, "data": {"items": [], "total": 0}}
+
     # 展平为直接 JOIN（避免旧版 tt1.* 暴露的 Primary.TaxonID 与 Determination.TaxonID 在子查询里重名歧义）；
     # 用当前鉴定（IsCurrent）的 TaxonID 关联学名。
     query = """
@@ -404,7 +422,7 @@ async def get_lot_string(catid: int):
     WHERE p."CatalogNumber" = $1
     """
 
-    records = await execute_query(query, catid)
+    records = await execute_query(query, catalog_number)
 
     return {
         "code": 20000,
@@ -976,7 +994,7 @@ async def get_lots_numbers_by_year(year: str):
     Get lot count by year.
     Mirrors the original getLotsNumbersByYear function.
     """
-    date_value = datetime.strptime(f"{year}-01-01", "%Y-%m-%d").date()
+    date_value = parse_year_start(year)
 
     query = """
     SELECT * FROM "Primary" p 

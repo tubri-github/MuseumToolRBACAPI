@@ -1,5 +1,6 @@
 from datetime import datetime, date
 
+import asyncpg
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field, validator
@@ -8,6 +9,7 @@ from app.db.database import execute_query, execute_mutation, execute_proc, execu
     execute_paginated_query_with_count
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 from app.api.endpoints.person import PersonModel, new_loan_people as create_loan_person
+from app.utils.request_params import SMALLINT_MAX, SMALLINT_MIN, parse_year_start
 
 router = APIRouter()
 
@@ -382,12 +384,49 @@ async def generate_new_gift_id():
     }
 
 
+def _check_quantities(data: LoanModel):
+    """Reject a quantity the column cannot hold, before the procedure runs.
+
+    t1."Quantity"/"QuantityReturned"/"QuantityResolved" are smallint, so a
+    curator typing a long number used to get a bare 500 "smallint out of range".
+    """
+    for position, item in enumerate(data.loanDetails, start=1):
+        for label, value in (("Quantity", item.Quantity),
+                             ("Quantity Returned", item.QuantityReturned),
+                             ("Quantity Resolved", item.QuantityResolved)):
+            if value is None:
+                continue
+            if not (SMALLINT_MIN <= value <= SMALLINT_MAX):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"{label} on lot row {position} is {value}. "
+                            f"It must be between 0 and {SMALLINT_MAX}."))
+
+
+def _translate_db_error(exc: Exception, data: LoanModel) -> HTTPException:
+    """Turn the two Postgres errors the loan form actually hits into advice.
+
+    Both used to reach the curator as a raw driver message.
+    """
+    if isinstance(exc, asyncpg.exceptions.UniqueViolationError):
+        return HTTPException(
+            status_code=400,
+            detail=(f"Loan number {data.loanNumber} already exists. "
+                    f"Pick a different number, or reopen the existing transaction."))
+    if isinstance(exc, asyncpg.exceptions.NumericValueOutOfRangeError):
+        return HTTPException(
+            status_code=400,
+            detail=f"A quantity on this loan is out of range (the limit is {SMALLINT_MAX}).")
+    return HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/loan", response_model=ResponseModel)
 async def new_loan(data: LoanModel):
     """
     Create a new loan.
     Mirrors the original newLoan function.
     """
+    _check_quantities(data)
     try:
         # Convert loan details to JSON
         loan_details = []
@@ -438,8 +477,10 @@ async def new_loan(data: LoanModel):
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _translate_db_error(e, data)
 
 
 @router.post("/uploan", response_model=ResponseModel)
@@ -448,6 +489,7 @@ async def update_loan(data: LoanModel):
     Update a loan.
     Mirrors the original updateLoan function.
     """
+    _check_quantities(data)
     try:
         # Convert loan details to JSON
         loan_details = []
@@ -503,8 +545,10 @@ async def update_loan(data: LoanModel):
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _translate_db_error(e, data)
 
 
 @router.get("/loancount/{year}", response_model=ResponseModel)
@@ -513,7 +557,7 @@ async def get_loan_numbers_by_year(year: str):
     Get loan count by year.
     Mirrors the original getLoanNumbersByYear function.
     """
-    date_value = datetime.strptime(f"{year}-01-01", "%Y-%m-%d").date()
+    date_value = parse_year_start(year)
 
     query = """
     SELECT * FROM t2 

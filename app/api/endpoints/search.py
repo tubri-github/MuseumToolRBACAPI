@@ -7,6 +7,7 @@ import asyncio
 from app.db.elasticsearch import get_es_client
 from app.services.search import search_ulm, search_ost, search_locality, search_taxon, search_loan, search_lots, dsl_from_filters, search_generic
 from app.services.es_sync import sync_all_data, sync_unified_data
+from app.utils.request_params import parse_int_list
 
 router = APIRouter()
 
@@ -153,10 +154,8 @@ async def search_lots_endpoint(
     """
     Search Lots data with optional filtering.
     """
-    # Process IDs if provided
-    id_list = None
-    if ids and ids != "":
-        id_list = [int(id_str) for id_str in ids.split(',') if id_str]
+    # Process IDs if provided (junk entries are dropped rather than raising)
+    id_list = parse_int_list(ids) or None
 
     # Build filter object
     filters = {
@@ -208,10 +207,8 @@ async def search_loans_endpoint(
     """
     Search Loan data with optional filtering.
     """
-    # Process IDs if provided
-    id_list = None
-    if ids and ids != "":
-        id_list = [int(id_str) for id_str in ids.split(',') if id_str]
+    # Process IDs if provided (junk entries are dropped rather than raising)
+    id_list = parse_int_list(ids) or None
 
     # Build filter object
     filters = {

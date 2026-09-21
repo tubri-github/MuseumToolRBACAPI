@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import asyncpg
 
 from app.db.database import execute_query, execute_mutation, execute_paginated_query_with_count, get_db
+from app.utils.request_params import parse_year_start
 from app.services.filter_engine import FilterSpec, FieldDef, build_where, build_global_search, parse_json_param
 
 router = APIRouter()
@@ -307,7 +308,7 @@ async def get_locality_numbers_by_year(year: str):
     Get locality count by year.
     Mirrors the original getLocalityNumbersByYear function.
     """
-    date_value = datetime.strptime(f"{year}-01-01", "%Y-%m-%d").date()
+    date_value = parse_year_start(year)
 
     query = """
     SELECT * FROM locality1 l
