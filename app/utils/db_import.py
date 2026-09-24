@@ -3,6 +3,13 @@ import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from app.db.database import execute_query, execute_mutation, execute_transaction, get_db
+from app.utils.validation import ImportValidationUtils
+
+
+def _parse_collect_date(text) -> Optional[datetime]:
+    """采集日期原文 -> StartDate。只认完整的年月日，不完整或认不出的返回 None（不猜）。"""
+    ok, ymd = ImportValidationUtils.validate_date(text)
+    return datetime.strptime(ymd, "%Y-%m-%d") if ok else None
 
 
 class DatabaseUtils:
@@ -598,7 +605,7 @@ class DatabaseUtils:
                         new_locality_id = temp_record.get('Locality1ID')
                         v_loc_id = temp_record.get('verbatim_localityid')
                         if v_loc_id is not None:
-                            new_locality_id = await conn.fetchval(
+                            new_loc = await conn.fetchrow(
                                 '''
                                 INSERT INTO locality1 ("LocalityString","Drainage","Country","State","County",
                                                        "WaterBody","VerbatimDate","VerbatimCollectors","TimeStampModified")
@@ -606,10 +613,23 @@ class DatabaseUtils:
                                        vl.verbatim_state, vl.verbatim_county, vl.verbatim_waterbody,
                                        vl.verbatim_collect_date, vl.verbatim_collector, NOW()
                                 FROM verbatim_locality vl WHERE vl.verbatim_localityid = $1
-                                RETURNING "Locality1ID"
+                                RETURNING "Locality1ID", "VerbatimDate"
                                 ''',
                                 v_loc_id,
                             )
+                            new_locality_id = new_loc["Locality1ID"]
+                            # 采集日期原文能解析成完整日期的，补 StartDate + year/month/day（loan 标签读 StartDate）；
+                            # "VI-1987"、"1987" 这类不完整的留 NULL，原文仍在 VerbatimDate。
+                            start_ts = _parse_collect_date(new_loc["VerbatimDate"])
+                            if start_ts is not None:
+                                await conn.execute(
+                                    '''
+                                    UPDATE locality1
+                                    SET "StartDate" = $2, "year" = $3, "month" = $4, "day" = $5
+                                    WHERE "Locality1ID" = $1
+                                    ''',
+                                    new_locality_id, start_ts, start_ts.year, start_ts.month, start_ts.day,
+                                )
 
                         primary_id = await conn.fetchval(
                             insert_primary_sql,

@@ -107,8 +107,13 @@ async def get_loan(loanid: str):
     Get loan by loan ID.
     Mirrors the original getLoan function.
     """
+    # loan_view 没有 VerbatimDate；batch 导入的 lot 只有采集日期原文、StartDate 可能为空，
+    # loan 标签要拿它兜底，所以在这里补 join（不改视图，省得远端跑 DDL）。
     query = """
-    SELECT * FROM loan_view lv 
+    SELECT lv.*, l."VerbatimDate"
+    FROM loan_view lv
+    LEFT JOIN "Primary" p ON p."PrimaryID" = lv."PrimaryID"
+    LEFT JOIN locality1 l ON l."Locality1ID" = p."Locality1ID"
     WHERE lv."LoanNumber" = $1
     """
 

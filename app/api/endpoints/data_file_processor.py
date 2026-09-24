@@ -417,6 +417,19 @@ async def validate_mapping(mapping_data: ImportMappingModel):
             message=f"Validation failed: {str(e)}"
         )
 
+def _verbatim_date_text(value) -> Optional[str]:
+    """把上传文件里的日期单元格转成原文字符串。
+    Excel 日期格会被 pandas 读成 Timestamp（str 后带 " 00:00:00"），纯年份会读成 1987.0，这两种要还原。"""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    return text or None
+
+
 def convert_numpy_types(obj):
     if isinstance(obj, dict):
         return {k: convert_numpy_types(v) for k, v in obj.items()}
@@ -1178,6 +1191,7 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                 "verbatim_longitude": None,
                 "verbatim_fieldno": None,
                 "verbatim_collector": None,
+                "verbatim_collect_date": None,
                 "original_text": None
             }
 
@@ -1205,6 +1219,12 @@ async def process_verbatim_import(file_id: str, batch_serial_id: str, user_id: O
                         verbatim_locality_record[verbatim_key] = str(value).strip()
                         locality_parts.append(f"{field_key}: {str(value).strip()}")
                         has_locality_data = True
+
+            # 采集日期存原文（标签照印），不过 validate_date —— 非标准写法（"VI-1987"、"summer 1987"）也要留住。
+            # 之前这里漏了，verbatim_collect_date 永远是 NULL → complete 后 locality1.VerbatimDate 全空。
+            if mappings.get("collectionDate") and mappings["collectionDate"] in df.columns:
+                verbatim_locality_record["verbatim_collect_date"] = _verbatim_date_text(
+                    row.get(mappings["collectionDate"]))
 
             # 如果有地点数据，设置original_text
             if has_locality_data:
