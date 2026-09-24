@@ -2408,6 +2408,7 @@ async def export_batch_results(batch_serial_id: str):
         query = """
         SELECT
             p."PrimaryID",
+            p."source_primary_id",
             p."CatalogNumber",
             p."final_catalog_number",
             p."final_primary_id",
@@ -2481,8 +2482,12 @@ async def export_batch_results(batch_serial_id: str):
                 df[col] = df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else (x if x else None))
 
         # Reorder and rename columns for better readability - updated to include field_number columns
+        # "PrimaryID" carries source_primary_id (the id from the uploaded source file), so a
+        # re-imported export maps its PrimaryID column to the same source record. primary_temp's
+        # own PrimaryID is only an internal row id; it used to be exported as "PrimaryID" and got
+        # mapped as the Source unique ID on re-import (e.g. 20260904-001 from 20260803-002's export).
         column_mapping = {
-            "PrimaryID": "PrimaryID",
+            "source_primary_id": "PrimaryID",
             "final_catalog_number": "Official Catalog Number",
             "CatalogNumber": "Catalog Number",
             "matched_family": "Family",
@@ -2518,7 +2523,8 @@ async def export_batch_results(batch_serial_id: str):
             "verbatim_lon": "Verbatim Longitude",
             "verbatim_field_number": "Verbatim Field Number",
             "verbatim_collection_date": "Verbatim Collection Date",
-            "verbatim_collector": "Verbatim Collector"
+            "verbatim_collector": "Verbatim Collector",
+            "PrimaryID": "Temp Row ID"
         }
 
         # Keep only the columns we want to export
