@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
 from app.db.database import execute_query, execute_mutation
+from app.utils.species_validation import SpeciesNameValidator
 
 router = APIRouter()
 
@@ -14,12 +15,21 @@ class TaxonModel(BaseModel):
     remarks: Optional[str] = None
     fullScientificName: str
     familyID: Optional[int] = None
+    # Which screen the row was added from; only tags created_via. Batch review sends nothing.
+    source: Optional[str] = None
 
 
 class CreateFamilyModel(BaseModel):
     family_name: str
     family_number: Optional[str] = None
     alias2: Optional[str] = None
+    source: Optional[str] = None
+
+
+# created_via tags per entry screen (memory: family_taxon_audit_columns). Unknown sources fall
+# back to the batch-review tag rather than letting the client write arbitrary audit values.
+_TAXON_CREATED_VIA = {"taxonomic_page": "taxonomic_page_create"}
+_FAMILY_CREATED_VIA = {"taxonomic_page": "taxonomic_page_add"}
 
 
 class ResponseModel(BaseModel):
@@ -149,15 +159,17 @@ async def create_family(payload: CreateFamilyModel):
 
     insert_query = """
     INSERT INTO "Family" ("FamilyName", "FamilyNumber", "Alias2", created_at, created_via)
-    VALUES ($1, $2, $3, NOW(), 'reviewer_add')
+    VALUES ($1, $2, $3, NOW(), $4)
     RETURNING "FamilyID", "FamilyName", "FamilyNumber", "Alias2"
     """
     family_number = payload.family_number.strip() if payload.family_number else None
     alias2 = payload.alias2.strip() if payload.alias2 else None
-    result = await execute_query(insert_query, family_name, family_number, alias2)
+    created_via = _FAMILY_CREATED_VIA.get(payload.source or "", "reviewer_add")
+    result = await execute_query(insert_query, family_name, family_number, alias2, created_via)
 
     if not result:
         raise HTTPException(status_code=500, detail="Failed to create family record")
+    print(f"[taxon] created FamilyID {result[0]['FamilyID']} '{family_name}' via={created_via}")
 
     return {
         "code": 20000,
@@ -271,43 +283,81 @@ async def get_determinations():
 @router.post("/taxon", response_model=ResponseModel)
 async def new_taxon(data: TaxonModel):
     """
-    Create a new taxon.
-    Mirrors the original newTaxon function.
+    Create a new taxon (batch review's CreateSpeciesForm and the Taxonomic > Add page).
+
+    Refuses a FullScientificName that already exists, case/whitespace-insensitively, and returns
+    the existing row under code 40900 instead. Duplicate rows are not harmless here: name
+    resolution picks one of the twins and the other strands whatever is determined against it
+    (memory: duplicate_taxa_merge -- 45 such groups already wait for a curator merge).
     """
+    def clean(v):
+        v = (v or "").strip()
+        return v or None
+
+    genus, species, subspecies = clean(data.genus), clean(data.species), clean(data.subspecies)
+    if not genus or not species:
+        return {"code": 40000, "data": {}, "message": "Genus and species are required"}
+    full_name = clean(data.fullScientificName) or " ".join(
+        p for p in (genus, species, subspecies) if p)
+    full_name = " ".join(full_name.split())
+
+    if data.familyID is None:
+        return {"code": 40000, "data": {}, "message": "Family is required"}
+    family = await execute_query(
+        'SELECT "FamilyID", "FamilyName" FROM "Family" WHERE "FamilyID" = $1', data.familyID)
+    if not family:
+        return {"code": 40000, "data": {}, "message": f"Family {data.familyID} does not exist"}
+
+    existing = await execute_query(
+        'SELECT tt."TaxonID", tt."FullScientificName", f."FamilyName" '
+        'FROM "TaxonomicTable" tt LEFT JOIN "Family" f ON f."FamilyID" = tt."FamilyID" '
+        'WHERE LOWER(TRIM(tt."FullScientificName")) = LOWER($1) '
+        'ORDER BY tt."TaxonID" LIMIT 1', full_name)
+    if existing:
+        e = existing[0]
+        return {
+            "code": 40900,
+            "data": {"taxon_id": e["TaxonID"], "full_name": e["FullScientificName"],
+                     "family_name": e["FamilyName"]},
+            "message": (f"'{e['FullScientificName']}' already exists "
+                        f"(TaxonID {e['TaxonID']}, family {e['FamilyName'] or 'none'})"),
+        }
+
     query = """
     INSERT INTO "TaxonomicTable" (
         "Genus", "Species", "Subspecies", "Remarks", "FullScientificName", "FamilyID",
         created_at, created_via
     )
-    VALUES ($1, $2, $3, $4, $5, $6, NOW(), 'reviewer_create')
+    VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
     RETURNING "TaxonID"
     """
+    created_via = _TAXON_CREATED_VIA.get(data.source or "", "reviewer_create")
 
     try:
         result = await execute_query(
-            query,
-            data.genus,
-            data.species,
-            data.subspecies,
-            data.remarks,
-            data.fullScientificName,
-            data.familyID
+            query, genus, species, subspecies, clean(data.remarks), full_name,
+            data.familyID, created_via
         )
-
-        # Sync the new data to Elasticsearch
-        if result and len(result) > 0:
-            taxon_id = result[0]["TaxonID"]
-
-        return {
-            "code": 20000,
-            "data": {
-                "items": result,
-                "total": len(result) if result else 0
-            }
-        }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # The batch name matcher caches the taxon table for an hour; without this the new name
+    # would not auto-match anything until the cache expired or the backend restarted.
+    SpeciesNameValidator.invalidate_taxonomic_cache()
+    print(f"[taxon] created TaxonID {result[0]['TaxonID']} '{full_name}' "
+          f"family={family[0]['FamilyName']} via={created_via}")
+
+    return {
+        "code": 20000,
+        "data": {
+            "items": result,
+            "total": len(result),
+            "taxon_id": result[0]["TaxonID"],
+            "full_name": full_name,
+            "family_id": family[0]["FamilyID"],
+            "family_name": family[0]["FamilyName"],
+        }
+    }
 
 
 @router.get("/determiners", response_model=ResponseModel)

@@ -183,11 +183,46 @@ validation_utils = ImportValidationUtils()
 species_validator = SpeciesNameValidator()
 
 
+async def _batch_file_names(batch_ids: List[str]) -> Dict[str, str]:
+    """Original upload name per batch, for the batch list.
+
+    batch_source_file only exists for batches imported after uploads started being kept, so older
+    batches fall back to the import log -- the same 'completed' batch_import entry, and the same
+    double-encoded JSONB unwrap, that get_batch_info reads for its metadata.
+    """
+    if not batch_ids:
+        return {}
+    names: Dict[str, str] = {}
+    try:
+        rows = await execute_query("""
+            SELECT DISTINCT ON (a.bid) a.bid, a.d ->> 'fileName' AS file_name
+            FROM (SELECT (action_details #>> '{}')::jsonb ->> 'batchSerialId' AS bid,
+                         (action_details #>> '{}')::jsonb AS d, created_at
+                  FROM system_logs WHERE action_type = 'batch_import') a
+            WHERE a.bid = ANY($1::text[]) AND a.d ->> 'status' = 'completed'
+            ORDER BY a.bid, a.created_at DESC
+        """, batch_ids)
+        names.update({r["bid"]: r["file_name"] for r in rows if r["file_name"]})
+    except Exception as e:
+        print(f"[batch list] import-log file names unavailable: {e}")
+    try:
+        rows = await execute_query(
+            "SELECT batch_serial_id, file_name FROM batch_source_file "
+            "WHERE batch_serial_id = ANY($1::text[])", batch_ids)
+        names.update({r["batch_serial_id"]: r["file_name"] for r in rows if r["file_name"]})
+    except Exception as e:
+        print(f"[batch list] batch_source_file unavailable: {e}")
+    return names
+
+
 # Batch management endpoints
 @router.get("/batches", response_model=ResponseModel)
 async def get_verbatim_batches(
         pagination: PaginationParams = Depends(),
-        filter_params: FilterParams = Depends()
+        filter_params: FilterParams = Depends(),
+        # The batch list page shows every batch and filters in the browser. Without this the
+        # default page_size of 10 silently hid the 11th-oldest batch and everything before it.
+        all_batches: bool = Query(False, alias="all")
 ):
     """
     Get list of verbatim batches for processing
@@ -202,7 +237,9 @@ async def get_verbatim_batches(
                SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as taxonomic_processed,
                SUM(CASE WHEN "Locality1ID" IS NOT NULL THEN 1 ELSE 0 END) as locality_processed,
                SUM(CASE WHEN "TaxonID" IS NOT NULL THEN 1 ELSE 0 END) as fully_processed,
-               MAX(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as is_migrated
+               MAX(CASE WHEN final_primary_id IS NOT NULL THEN 1 ELSE 0 END) as is_migrated,
+               COUNT(*) FILTER (WHERE "overall_verification_status" = 'completed') as completed_records,
+               COUNT(*) FILTER (WHERE final_primary_id IS NOT NULL) as cataloged_records
         FROM primary_temp
         WHERE batch_serial_id IS NOT NULL
         """
@@ -252,14 +289,16 @@ async def get_verbatim_batches(
         # Add group by and pagination
         base_query += """ 
         GROUP BY batch_serial_id
-        ORDER BY import_date DESC
-        LIMIT $""" + str(param_index) + " OFFSET $" + str(param_index + 1)
-
-        params.extend([pagination.page_size, (pagination.page - 1) * pagination.page_size])
+        ORDER BY import_date DESC"""
+        if not all_batches:
+            base_query += " LIMIT $" + str(param_index) + " OFFSET $" + str(param_index + 1)
+            params.extend([pagination.page_size, (pagination.page - 1) * pagination.page_size])
 
         # Execute queries
         batch_results = await execute_query(base_query, *params)
         count_result = await execute_query(count_query, *params[:param_index - 1])
+
+        file_names = await _batch_file_names([b["batch_serial_id"] for b in batch_results])
 
         # Format results
         batches = []
@@ -281,6 +320,9 @@ async def get_verbatim_batches(
                 "import_date": batch["import_date"].isoformat() if batch["import_date"] else None,
                 "total_records": total,
                 "status": status,
+                "file_name": file_names.get(batch["batch_serial_id"]),
+                "completed_records": batch["completed_records"],
+                "cataloged_records": batch["cataloged_records"],
                 "progress": {
                     "taxonomic": {
                         "processed": taxonomic_processed,

@@ -369,6 +369,15 @@ class SpeciesNameValidator:
     _cached_db_data = None
     _cache_timestamp = None
     _cache_ttl = 3600  # 缓存1小时
+    # Bumped by invalidate_taxonomic_cache() whenever a taxon is added by hand. The validator is
+    # a module-level singleton in two endpoint modules, so a per-instance reset would need both
+    # imported; comparing against a class-level counter reaches every instance instead.
+    _data_version = 0
+    _cache_version = 0
+
+    @classmethod
+    def invalidate_taxonomic_cache(cls):
+        cls._data_version += 1
 
     async def _get_cached_taxonomic_data(self):
         """获取缓存的分类数据，如果缓存过期则重新加载"""
@@ -377,7 +386,11 @@ class SpeciesNameValidator:
         current_time = time.time()
         if (self._cached_db_data is None or
             self._cache_timestamp is None or
+            self._cache_version != SpeciesNameValidator._data_version or
             current_time - self._cache_timestamp > self._cache_ttl):
+            # Taken before the query, so a taxon added while this load is in flight still
+            # forces the next call to reload.
+            loading_version = SpeciesNameValidator._data_version
 
             # Read "TaxonomicTable" directly instead of the taxonomic_table VIEW. The view
             # exposes only Genus/Species, so every subspecies collapsed onto its species'
@@ -512,6 +525,7 @@ class SpeciesNameValidator:
                 'subspecies_index': subspecies_index
             }
             self._cache_timestamp = current_time
+            self._cache_version = loading_version
 
         return self._cached_db_data
 
