@@ -197,6 +197,9 @@ LOTS_SPEC = FilterSpec(
         "inventory":       FieldDef('p."Inventory"', "text", "Inventory", "Specimen"),
         "total_number":    FieldDef('p."TotalNumber"', "number", "Total Number", "Specimen"),
         "remarks":         FieldDef('p."Remarks"', "text", "Remarks", "Specimen"),
+        # 一个 lot 可有多条制作记录（如 Fluid + C&S）→ EXISTS，「有任一制作是 X」即命中
+        "preparation":     FieldDef('pp."PreparationType"', "enum", "Preparation", "Specimen",
+                                    exists_from='"Preparation" pp WHERE pp."PrimaryID" = p."PrimaryID"'),
         "family":          FieldDef('f."FamilyName"', "text", "Family", "Taxonomy"),
         "genus":           FieldDef('tt."Genus"', "text", "Genus", "Taxonomy"),
         "species":         FieldDef('tt."Species"', "text", "Species", "Taxonomy"),
@@ -251,7 +254,13 @@ async def get_lots_filter_metadata():
     末尾追加两个「pick」伪字段：scientific name / family 的 taxon 感知 typeahead（前端特殊渲染，
     映射到 taxon_id/family_id + 三层开关，不走通用 SQL 过滤）。
     """
-    fields = LOTS_SPEC.to_metadata() + [
+    fields = LOTS_SPEC.to_metadata()
+    # Preparation 下拉选项取规范表 PreparationTypes（数据里另有少量脏值如 '195'/'FF'，不进下拉）
+    prep_types = await execute_query('SELECT "PreparationType" FROM "PreparationTypes" ORDER BY "PreparationTypeID"')
+    for f in fields:
+        if f["key"] == "preparation":
+            f["options"] = [r["PreparationType"] for r in prep_types if r["PreparationType"]]
+    fields = fields + [
         {"key": "taxon_pick", "label": "Scientific Name (taxon match)", "group": "Taxonomy",
          "type": "taxon", "operators": ["match"]},
         {"key": "family_pick", "label": "Family (taxon match)", "group": "Taxonomy",

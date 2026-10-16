@@ -47,6 +47,9 @@ class FieldDef:
     label: str = ""                       # 前端展示名（metadata 用）
     group: str = ""                       # 前端分组（metadata 用）
     options: Optional[List[str]] = None   # enum 可选值（可选）
+    # 一对多子表字段：'<子表> <别名> WHERE <关联条件>'。设了以后条件包成 EXISTS(...)，
+    # 不 JOIN 子表（避免乘行），也不参与排序。如 lots 的 Preparation。
+    exists_from: Optional[str] = None
 
 
 @dataclass
@@ -88,7 +91,7 @@ class FilterSpec:
     def order_clause(self, sort_by: Optional[str], sort_order: Optional[str]) -> Optional[str]:
         """把前端传的 sort_by(api 字段名) + sort_order 翻译成安全的 ORDER BY 片段（白名单防注入）。"""
         fd = self.fields.get(sort_by) if sort_by else None
-        if not fd:
+        if not fd or fd.exists_from:
             return None
         direction = "ASC" if str(sort_order).lower() in ("asc", "ascending") else "DESC"
         return f"{fd.sql} {direction} NULLS LAST"
@@ -96,6 +99,23 @@ class FilterSpec:
 
 def _cast_text(expr: str) -> str:
     return f"{expr}::text"
+
+
+def _wrap(fd: FieldDef, clause: str) -> str:
+    """子表字段：把针对子表列的条件包进 EXISTS（「有任一子行满足」）。"""
+    if not fd.exists_from:
+        return clause
+    return f"EXISTS (SELECT 1 FROM {fd.exists_from} AND {clause})"
+
+
+def _empty_clause(fd: FieldDef, empty: bool) -> str:
+    """__EMPTY__ / __NOT_EMPTY__。子表字段：empty = 没有任何非空子行。"""
+    not_empty = f"({fd.sql} IS NOT NULL AND TRIM({_cast_text(fd.sql)}) <> '')"
+    if fd.exists_from:
+        return ("NOT " if empty else "") + _wrap(fd, not_empty)
+    if empty:
+        return f"({fd.sql} IS NULL OR TRIM({_cast_text(fd.sql)}) = '')"
+    return not_empty
 
 
 def _coerce(fd: FieldDef, v: Any) -> Any:
@@ -219,23 +239,26 @@ def build_where(
                 continue
 
             or_terms: List[str] = []
+            value_terms: List[str] = []
             for val in normal:
                 if fd.type == "enum":
                     # 枚举做大小写无关的精确等于（空格归一）
-                    or_terms.append(f"LOWER(TRIM({_cast_text(fd.sql)})) = LOWER(TRIM(${p}))")
+                    value_terms.append(f"LOWER(TRIM({_cast_text(fd.sql)})) = LOWER(TRIM(${p}))")
                     params.append(val)
                 else:
                     # 列和值都剥内部空白再 ILIKE，容忍 "A.AFFINIS" vs "A. affinis"
-                    or_terms.append(
+                    value_terms.append(
                         f"REGEXP_REPLACE({_cast_text(fd.sql)}, '[[:space:]]+', '', 'g') "
                         f"ILIKE REGEXP_REPLACE(${p}, '[[:space:]]+', '', 'g')"
                     )
                     params.append(f"%{val}%")
                 p += 1
+            if value_terms:
+                or_terms.append(_wrap(fd, "(" + " OR ".join(value_terms) + ")"))
             if has_empty:
-                or_terms.append(f"({fd.sql} IS NULL OR TRIM({_cast_text(fd.sql)}) = '')")
+                or_terms.append(_empty_clause(fd, True))
             if has_not_empty:
-                or_terms.append(f"({fd.sql} IS NOT NULL AND TRIM({_cast_text(fd.sql)}) <> '')")
+                or_terms.append(_empty_clause(fd, False))
             where.append("(" + " OR ".join(or_terms) + ")")
 
     # 4) structured_filters → 显式操作符的精确/区间比较
@@ -260,7 +283,7 @@ def build_where(
                     terms.append(f"LOWER(TRIM({_cast_text(fd.sql)})) = LOWER(TRIM(${p}))")
                     params.append(v)
                     p += 1
-                where.append("(" + " OR ".join(terms) + ")")
+                where.append(_wrap(fd, "(" + " OR ".join(terms) + ")"))
             elif op == "in":
                 coerced = [_coerce(fd, v) for v in vals if str(v).strip() != ""]
                 if coerced:
@@ -269,29 +292,29 @@ def build_where(
                         placeholders.append(f"${p}")
                         params.append(cv)
                         p += 1
-                    where.append(f"{fd.sql} IN (" + ",".join(placeholders) + ")")
+                    where.append(_wrap(fd, f"{fd.sql} IN (" + ",".join(placeholders) + ")"))
             elif op == "between":
                 lo = vals[0] if len(vals) > 0 else None
                 hi = vals[1] if len(vals) > 1 else None
                 if lo not in (None, ""):
-                    where.append(f"{fd.sql} >= ${p}")
+                    where.append(_wrap(fd, f"{fd.sql} >= ${p}"))
                     params.append(_coerce(fd, lo))
                     p += 1
                 if hi not in (None, ""):
-                    where.append(f"{fd.sql} <= ${p}")
+                    where.append(_wrap(fd, f"{fd.sql} <= ${p}"))
                     params.append(_coerce(fd, hi))
                     p += 1
             elif op in _CMP:
                 if not vals:
                     continue
-                where.append(f"{fd.sql} {_CMP[op]} ${p}")
+                where.append(_wrap(fd, f"{fd.sql} {_CMP[op]} ${p}"))
                 params.append(_coerce(fd, vals[0]))
                 p += 1
             elif op == "fuzzy":
                 # 单列 trigram 模糊：similarity >= 阈值（容忍拼写错误）
                 if not vals:
                     continue
-                where.append(f"similarity({_cast_text(fd.sql)}, ${p}) >= ${p + 1}")
+                where.append(_wrap(fd, f"similarity({_cast_text(fd.sql)}, ${p}) >= ${p + 1}"))
                 params.append(str(vals[0]))
                 params.append(FUZZY_THRESHOLD)
                 p += 2
