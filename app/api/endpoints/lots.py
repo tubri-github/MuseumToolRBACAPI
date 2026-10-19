@@ -942,15 +942,18 @@ async def update_lot(data: LotModel):
     """
     try:
         # Format determinations
+        # 存储过程里对这些字段做 ::INTEGER / ::DATE，前端没填的字段发 ""，直接传进去会 500
+        # （invalid input syntax for type integer: ""）。int/date 字段一律 "" -> None。
         determinations = []
         for det in data.zDetermination:
+            determination = det.get("determination", {}) or {}
             determinations.append({
                 "isCurrent": det.get("isCurrent", False),
-                "determinationID": det.get("determinationID", None),
-                "determinerID": det.get("determination", {}).get("determinerID", None),
-                "determinerName": det.get("determination", {}).get("determinerName", None),
-                "taxonId": det.get("taxonId", None),
-                "date": det.get("date", None),
+                "determinationID": _opt_int(det.get("determinationID")),
+                "determinerID": _opt_int(determination.get("determinerID")),
+                "determinerName": determination.get("determinerName", None),
+                "taxonId": _opt_int(det.get("taxonId")),
+                "date": det.get("date") or None,
                 "remarks": det.get("remarks", None)
             })
 
@@ -958,9 +961,9 @@ async def update_lot(data: LotModel):
         preparations = []
         for prep in data.preparation:
             preparations.append({
-                "preparationID": prep.get("preparationID", None),
+                "preparationID": _opt_int(prep.get("preparationID")),
                 "preparationType": prep.get("preparationType", None),
-                "count": prep.get("count", None)
+                "count": _opt_int(prep.get("count"))
             })
 
         # Call the stored procedure
