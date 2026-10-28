@@ -3,7 +3,7 @@ from datetime import datetime, date
 import asyncpg
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, root_validator
 
 from app.db.database import execute_query, execute_mutation, execute_proc, execute_single_query, \
     execute_paginated_query_with_count
@@ -74,15 +74,49 @@ class LoanModel(BaseModel):
         if isinstance(v, datetime):
             return v.date()
         if isinstance(v, str):
-            s = v.strip().replace("Z", "+00:00")
-            try:
-                return datetime.fromisoformat(s).date()
-            except ValueError:
-                try:
-                    return date.fromisoformat(v.strip()[:10])
-                except ValueError:
-                    return v
+            if v.strip().upper() in ("", "NA", "N/A"):
+                return None
+            parsed = parse_legacy_loan_date(v)
+            return parsed if parsed is not None else v
         return v
+
+    @root_validator(skip_on_failure=True)
+    def _closed_not_before_loan(cls, values):
+        loan_date, date_closed = values.get("loanDate"), values.get("dateClosed")
+        if loan_date and date_closed and date_closed < loan_date:
+            raise ValueError(f"dateClosed ({date_closed}) cannot be earlier than loanDate ({loan_date})")
+        return values
+
+
+# 老借阅单的 LoanDate/DateClosed 是 varchar，存着各种写法；编辑页原样读回原样提交，
+# 只认 ISO 的话一存就报 "invalid date format"。
+_LEGACY_DATE_FORMATS = (
+    "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%Y/%m/%d",
+    "%b %d %Y", "%d %b %Y", "%B %d %Y", "%d %B %Y",
+)
+
+
+def parse_legacy_loan_date(v: str) -> Optional[date]:
+    s = v.strip()
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        pass
+    s = s.replace("Sept ", "Sep ")
+    for fmt in _LEGACY_DATE_FORMATS:
+        try:
+            d = datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+        # %y 把 00-68 当 20xx；借阅单不可能在未来
+        if d > date.today():
+            d = d.replace(year=d.year - 100)
+        return d
+    return None
 
 
 class ResponseModel(BaseModel):
